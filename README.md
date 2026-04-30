@@ -1,146 +1,135 @@
-# Polymarket Trading Bot
+# Polymarket Weather Bot v2
 
-Bot de trading autonomo para Polymarket con analisis mediante Claude AI, sistema de auto-mejora, dashboard web y notificaciones Telegram.
+Bot autonomo enfocado exclusivamente en mercados meteorologicos de Polymarket.
+El nucleo del sistema es un **ensemble multi-fuente** de forecasts combinado con
+un **motor de confidence** que decide si la oportunidad merece ser apostada.
+
+Claude AI actua como revisor final (sanity check, no recalcula el forecast).
 
 ## Caracteristicas
 
-- **Estrategia Bonding**: Compra outcomes de alta probabilidad (0.88-0.97) para capturar retornos seguros
-- **Arbitraje Sum-to-One**: Detecta cuando YES + NO < 1.0 para profit garantizado
-- **Agente Claude**: Analiza oportunidades con razonamiento paso a paso y calculo de EV
-- **Sistema de Memoria**: Auto-mejora continua con reglas aprendidas y ajuste de parametros
-- **Risk Management**: Kelly Criterion al 25%, stop-losses, take-profits, limites de exposicion
-- **Dashboard Web**: Monitoreo en tiempo real con graficos y estadisticas
-- **Notificaciones Telegram**: Alertas de trades y errores criticos
-- **Modo DEMO**: Simulacion completa sin riesgo de capital real
+- **Ensemble multi-fuente**: 4 APIs gratuitas (Open-Meteo, NOAA GFS, ECMWF Open Data, MET Norway)
+  + 4 APIs opcionales con key (Visual Crossing, OpenWeatherMap, WeatherAPI, Tomorrow.io).
+  El bot funciona en modo degradado con las fuentes disponibles.
+- **Confidence engine 0-100** con componentes ponderados (acuerdo del ensemble,
+  edge, liquidez, tiempo a resolucion, n. de fuentes) y vetos duros
+  (pocas fuentes, std alta, edge sospechoso, rolling WR malo del lado).
+- **Pyramiding adaptativo**: solo permitido con `confidence >= 80` y condiciones
+  de mercado cambiadas.
+- **PID lock**: garantia de un solo proceso (psutil). Al arrancar, si hay otro
+  bot corriendo aborta; si el lock es huerfano lo limpia.
+- **Shadow mode**: ejecuta todo el pipeline sin enviar ordenes; ideal para
+  backtest en vivo.
+- **Logging estructurado** (`logs/events.jsonl`) con `trace_id` por trade y
+  codigos de skip enumerados. `log_analyzer.py` genera reportes markdown.
+- **Dashboard web** con: health panel, fiabilidad por fuente (Brier), chart
+  de calibracion, motivos de skip, trades abiertos/cerrados.
+- **Notificaciones Telegram** para trades, errores, fuente caida, anomalias
+  de confidence y violaciones de lock.
+
+## Arquitectura
+
+```
+main.py
+  +-- PolymarketAPI           (scan_weather_markets)
+  +-- WeatherBotStrategy       (async find_opportunities)
+  |     +-- weather_sources/   (cada fuente implementa .forecast())
+  |     +-- weather_ensemble   (media ponderada + std + prob)
+  |     +-- confidence_engine  (score + vetos)
+  +-- RiskManager              (can_add_to_market + pyramiding + Kelly)
+  +-- ClaudeAgent              (sanity check final)
+  +-- Database / StructuredLogger / TelegramNotifier / MemorySystem
+```
 
 ## Requisitos
 
 - Python 3.10+
-- Cuenta en Anthropic (API key para Claude)
-- (Opcional) Token de Telegram para notificaciones
-- (Solo LIVE) Wallet de Polymarket con fondos en Polygon
+- `pip install -r requirements.txt`
+- `ANTHROPIC_API_KEY` (obligatoria)
+- API keys opcionales para fuentes premium (ver `.env.example`)
 
-## Instalacion
+## Quick start
 
 ```bash
-# Clonar o copiar el proyecto
-cd polymarket-bot
-
-# Crear entorno virtual
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate     # Windows
-
-# Instalar dependencias
+# 1. Instalar deps
 pip install -r requirements.txt
 
-# Configurar variables de entorno
+# 2. Configurar .env con ANTHROPIC_API_KEY
 cp .env.example .env
-# Editar .env con tu ANTHROPIC_API_KEY
+# edita .env
+
+# 3. Lanzar
+start.bat
 ```
 
-## Configuracion
+Menu de `start.bat`:
 
-### .env
-```
-ANTHROPIC_API_KEY=sk-ant-tu-clave-aqui
-TELEGRAM_TOKEN=tu-bot-token        # opcional
-TELEGRAM_CHAT_ID=tu-chat-id        # opcional
-```
+| Opc. | Modo |
+|------|------|
+| 1 | DEMO - simulacion con ordenes fake |
+| 2 | LIVE - ordenes reales (pide `CONFIRMO`) |
+| 3 | Solo dashboard |
+| 4 | Shadow mode (EXECUTE_TRADES=false) |
+| 5 | Analizar logs ultimas 24h (markdown) |
+| 6 | Backup + wipe datos (a `data/archive/YYYYMMDD_HHMM/`) |
 
-### config.yaml
-El archivo `config.yaml` contiene toda la configuracion del bot:
+## Ficheros clave
 
-- `bot.mode`: DEMO o LIVE
-- `bot.cycle_interval_minutes`: Intervalo entre ciclos (default: 10)
-- `bot.demo_capital`: Capital inicial simulado (default: 1000)
-- `risk.*`: Parametros de riesgo (EV minimo, Kelly fraction, stop-loss, etc.)
-- `strategies.*`: Configuracion de cada estrategia
-- `claude.model`: Modelo de Claude a usar
-- `memory.*`: Configuracion del sistema de auto-mejora
+| Fichero | Descripcion |
+|---------|-------------|
+| [main.py](main.py) | Loop principal + PID lock + shadow mode |
+| [config.yaml](config.yaml) | Thresholds (min_confidence, ventanas horarias, Kelly, etc.) |
+| [strategies/weather_bot.py](strategies/weather_bot.py) | Parser de preguntas + pipeline async |
+| [strategies/weather_ensemble.py](strategies/weather_ensemble.py) | Agregador de forecasts |
+| [strategies/confidence_engine.py](strategies/confidence_engine.py) | Score + vetos |
+| [strategies/weather_sources/](strategies/weather_sources/) | Adaptadores por proveedor |
+| [risk_manager.py](risk_manager.py) | Kelly + pyramiding + limites |
+| [database.py](database.py) | SQLite: trades, skips, source_reliability, cycles |
+| [structured_logger.py](structured_logger.py) | JSONL event log |
+| [dashboard.py](dashboard.py) | Flask + Chart.js |
+| [log_analyzer.py](log_analyzer.py) | Reporte markdown desde DB+JSONL |
+| [claude_agent.py](claude_agent.py) | Revisor final weather-only |
 
-## Ejecucion
+## Umbrales relevantes (config.yaml)
 
-### Modo DEMO (recomendado para empezar)
-```bash
-python main.py --mode demo
-```
-
-### Dashboard (en otra terminal)
-```bash
-python dashboard.py
-# Abrir http://localhost:5000
-```
-
-### Modo LIVE (dinero real)
-```bash
-# Asegurate de tener POLYMARKET_PRIVATE_KEY en .env
-python main.py --mode live
-```
-
-## Como funciona
-
-### Ciclo de Trading
-1. Escanea mercados activos via Gamma API
-2. Revisa stop-losses y take-profits de posiciones abiertas
-3. Busca oportunidades con estrategias bonding y arbitraje
-4. Claude analiza las oportunidades y decide BUY o SKIP
-5. Ejecuta trades (max 3 por ciclo) con validacion de riesgo
-6. Sistema de memoria analiza resultados y aprende
-
-### Sistema de Memoria (Auto-Mejora)
-El bot mejora continuamente a traves de 4 mecanismos:
-
-1. **Historial como Contexto**: Claude recibe los ultimos 20 trades cerrados para calibrar estimaciones
-2. **Auto-Analisis Post-Trade**: Cada trade cerrado se analiza para identificar sesgos y extraer lecciones
-3. **Reglas Aprendidas**: Cada 20 ciclos, el bot extrae reglas de sus analisis (ej: "evitar mercados politicos a >30 dias")
-4. **Ajuste de Parametros**: Cada 20 ciclos, revisa y ajusta EV threshold, Kelly fraction, etc.
-
-### Estrategias
-
-**Bonding**: Compra outcomes con probabilidad alta (88-97%) que estan cerca de resolverse. El retorno es pequeno pero casi seguro, similar a un bono.
-
-**Arbitraje Sum-to-One**: Cuando la suma de precios YES + NO es menor a ~0.985, comprar ambos lados garantiza un profit al resolver el mercado.
-
-## Estructura del Proyecto
-
-```
-polymarket-bot/
-├── main.py              # Orquestador principal
-├── config.yaml          # Configuracion
-├── polymarket_api.py    # Cliente API Gamma/CLOB
-├── claude_agent.py      # Agente Claude AI
-├── risk_manager.py      # Gestion de riesgo
-├── database.py          # SQLite persistencia
-├── memory.py            # Sistema de auto-mejora
-├── dashboard.py         # Dashboard Flask
-├── notifications.py     # Notificaciones Telegram
-├── strategies/
-│   ├── __init__.py
-│   ├── bonding.py       # Estrategia bonding
-│   └── arbitrage.py     # Estrategia arbitraje
-├── requirements.txt
-├── .env.example
-├── data/                # Base de datos SQLite (auto-creado)
-└── logs/                # Logs diarios (auto-creado)
+```yaml
+weather:
+  min_edge: 0.12
+  kelly_fraction: 0.15
+  max_position_pct: 0.03
+  min_confidence: 75
+  min_confidence_pyramid: 80
+  ensemble_std_max_c: 3.0
+  ensemble_std_max_mm: 8.0
+  max_trades_per_cycle: 2
+  max_concurrent_positions: 4
+  max_total_exposure_pct: 0.20
+  max_exposure_per_market_pct: 0.15
+  trading_windows_utc: [[0, 2], [4, 7]]
 ```
 
-## Paso a LIVE
+## Criterio para pasar de shadow -> LIVE
 
-1. Configura tu wallet de Polymarket en Polygon
-2. Agrega `POLYMARKET_PRIVATE_KEY` a `.env`
-3. Cambia `bot.mode: LIVE` en `config.yaml` o ejecuta con `--mode live`
-4. Empieza con capital bajo y parametros conservadores
-5. Monitorea el dashboard y logs constantemente
+72h acumuladas (shadow + smoke) con:
+- WR >= 55% sobre >= 10 trades
+- PnL positivo
+- Dashboard health verde (>=3 fuentes disponibles)
 
-## Seguridad
+## Limitaciones conocidas
 
-- **NUNCA** compartas tu `.env` o private key
-- En modo DEMO no se hacen llamadas a endpoints de ejecucion
-- Los stop-losses protegen contra perdidas excesivas
-- El Kelly Criterion al 25% es conservador por diseno
-- Limite de exposicion total del 20% del portfolio
+- Parser usa `15:00 UTC` como aproximacion para mercados daily-max-temp.
+- ECMWF Open Data llega como GRIB2: se cachea por ciclo.
+- Sin API keys premium el ensemble corre con 3-4 fuentes (funcional pero con
+  mayor std y menos sensibilidad a outliers).
 
-## Logs
+## Logs y analisis
 
-Los logs se guardan en `logs/bot_YYYY-MM-DD.log` con rotacion diaria. Colores en consola para facilitar lectura.
+- Logs legibles: `logs/bot_YYYY-MM-DD.log` (rotacion diaria, sin borrado)
+- Eventos estructurados: `logs/events.jsonl`
+- Reporte manual: `python log_analyzer.py --last-hours 24 --output reports/`
+- Dashboard en `http://localhost:5000` con auto-refresh 30s
+
+## Soporte
+
+- `/help` - no disponible, este es un proyecto personal
+- Feedback / bugs: issues en el repo local

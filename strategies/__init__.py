@@ -1,4 +1,2 @@
-from strategies.bonding import BondingStrategy
-from strategies.arbitrage import ValueBettingStrategy, MomentumStrategy
-
-__all__ = ["BondingStrategy", "ValueBettingStrategy", "MomentumStrategy"]
+# Weather Bot v2 package. Legacy strategies (bonding, arbitrage, momentum,
+# crypto_*) have been removed from this package.

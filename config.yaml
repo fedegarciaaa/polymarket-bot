@@ -1,62 +1,198 @@
+# ============================================================
+# Polymarket Weather Bot - config
+# Scope: ONLY Weather markets on Polymarket.
+# Rediseño v3: criterio principal = prob_real, confidence_engine degradado a vetos duros,
+# umbral adaptativo por horizonte (1-7 días), re-evaluación cada ciclo, reset on start.
+# ============================================================
+
 bot:
-  mode: DEMO
-  cycle_interval_minutes: 10
-  max_concurrent_positions: 5
+  mode: DEMO                  # DEMO | LIVE (start.bat controls this)
+  cycle_interval_minutes: 10  # re-evaluación cada 10 min (era 5)
+  max_concurrent_positions: 3
   demo_capital: 1000.0
-  max_trades_per_cycle: 3
+  max_trades_per_cycle: 2
+  reset_on_start: true        # borra trades/ciclos/skips/events antes de arrancar
+  keep_last_n_runs: 3         # archivos comprimidos en logs/archive/
+  reset_rules: false          # mantener learned_rules entre runs por defecto
+
+# Trading windows (UTC). Empty list = 24/7.
+trading_windows_utc: []
 
 risk:
-  max_position_pct: 0.05
+  max_position_pct: 0.02
   max_total_exposure_pct: 0.20
-  stop_loss_pct: 0.40
-  take_profit_partial_pct: 0.80
-  take_profit_sell_fraction: 0.50
-  min_ev_threshold: 0.02
-  min_liquidity_usdc: 5000
-  min_volume_24h: 10000
-  kelly_fraction: 0.25
+  max_exposure_per_market_pct: 0.15
+  # HOLD-TO-RESOLUTION política estricta: cada apuesta se mantiene hasta que
+  # Polymarket resuelva el mercado (end_date). Sin stop-loss, sin take-profit
+  # parcial, sin auto-cierre anticipado. Si la seguridad cae por debajo de
+  # `weather.degrade_threshold` solo se marca la posición como degraded y se
+  # bloquea cualquier re-apuesta futura — no se vende.
+  min_ev_threshold: 0.05
+  min_liquidity_usdc: 500
+  min_volume_24h: 1000
+  kelly_fraction: 0.15
+  # Comisión simulada al cerrar/vender posición en DEMO (slippage + fee).
+  sell_slippage_pct: 0.005
+  # Orderbook depth requerido para ejecutar una orden (LIVE). El ask_size debe
+  # ser al menos `depth_frac * shares_solicitadas`, si no el trade se saltaría
+  # por insuficiente liquidez (en DEMO solo se loggea, no bloquea).
+  min_orderbook_depth_frac: 0.30
 
-strategies:
-  bonding:
-    enabled: true
-    min_price: 0.80
-    max_price: 0.97
-    min_annualized_return: 0.15
-    max_days_to_resolution: 90
-  value_betting:
-    enabled: true
-    min_price: 0.10
-    max_price: 0.90
-    min_volume_24h: 20000
-    min_liquidity: 10000
-  momentum:
-    enabled: true
-    min_volume_24h: 50000
-    min_price: 0.15
-    max_price: 0.85
+# Confidence engine degradado a VETOS DUROS — ya no hay score compuesto que bloquee.
+# El criterio de entrada real es weather.min_prob_to_bet (por horizonte).
+confidence:
+  # Vetos duros
+  min_sources_required: 2
+  max_edge_pts: 35              # edge > 35 pts → casi seguro bug (bajado de 55 para ser más conservador)
+  min_time_to_resolution_hours: 1
+
+# Weather Bot params
+weather:
+  enabled: true
+  # Umbral de probabilidad real mínima para apostar, por horizonte (días hasta resolución).
+  # A mayor horizonte, los forecasts son más ruidosos → exige más seguridad.
+  # Histórico: subido 28-Apr a 0.70/0.75/0.80 tras pérdidas en miscalibrations.
+  # Bajado 30-Apr a 0.65/0.70/0.75 tras 9h con 0 trades (mejor LOW_CONFIDENCE
+  # alcanzable hoy fue 0.517 — los thresholds anteriores eran demasiado altos
+  # para el universo actual). city_bias.py + min_abs_edge=0.05 + max_edge_pts=35
+  # siguen protegiendo contra los miscalibrations que motivaron el endurecimiento.
+  min_prob_to_bet_by_days:
+    "1-3": 0.65
+    "4-5": 0.70
+    "6-7": 0.75
+  # Ventana hours-to-resolution en la que el bot opera. Fuera de ella el ruido
+  # domina (muy corto) o el ensemble std es inmanejable (muy largo).
+  min_hours_to_resolution: 18
+  max_hours_to_resolution: 168   # 7 días
+  # Cluster caps: máx trades abiertos en la misma target_date (= mismo día que
+  # resuelve) o del mismo condition_type para evitar concentrar en correlados.
+  max_trades_per_target_date: 5
+  max_trades_per_condition_type: 10
+  # Edge-quality gate — reemplaza el viejo `min_edge` fijo.
+  # abs_edge   = prob_real - price           (edge absoluto)
+  # kelly_edge = abs_edge / (1 - price)      (fracción Kelly real)
+  # Ambos deben superar su umbral. El `kelly_edge` permite "safe bets" caras
+  # (price=0.90, prob=0.97 → kelly_edge=0.70) y rechaza edges pobres
+  # (price=0.87, prob=0.91 → kelly_edge=0.31).
+  min_abs_edge:   0.05
+  min_kelly_edge: 0.20
+  min_edge: 0.025     # compat (no lo lee weather_bot pero otros scripts/reports sí)
+  # Peso del ensemble en el blend bayesiano con el mercado.
+  ensemble_weight: 0.50
+  max_days_ahead: 7
+  min_liquidity: 200
+  min_volume: 500
+  kelly_fraction: 0.15
+  max_position_pct: 0.03
+  max_bets_per_cycle: 2
+  scan_limit: 1500
+  # Porción inicial del Kelly a usar en la primera entrada — el resto se reserva para averaging up.
+  initial_entry_fraction: 0.50
+  # Averaging up: si prob_real sube al menos este delta vs entrada, añadir
+  # 1/3 (0.333) del tamaño inicial. Máximo `avg_up_max_count` re-apuestas.
+  avg_up_prob_delta: 0.05
+  avg_up_size_fraction: 0.333
+  # Re-evaluación de posiciones abiertas — política HOLD-only.
+  # Si la seguridad cae por debajo de `degrade_threshold`, la posición se marca
+  # como DEGRADED: no se vende, pero se bloquea cualquier re-apuesta (averaging up)
+  # en ese mercado. Si sube sobre `redegrade_clear_threshold` el flag se levanta.
+  degrade_threshold: 0.50
+  redegrade_clear_threshold: 0.70
+  # Límite duro de averaging-up por mercado (entrada inicial + N re-apuestas).
+  avg_up_max_count: 2
+  # Circuit-breaker: cierre de emergencia cuando el precio de mercado colapsa
+  # a < circuit_breaker_price_pct × entry_price Y quedan < circuit_breaker_hours_left
+  # horas para resolución. Sirve para recuperar el pequeño residual antes de que
+  # el mercado resuelva a 0. Activado tras diagnóstico 29-Abr (trade Seoul colapsado).
+  circuit_breaker_enabled: true
+  circuit_breaker_price_pct: 0.05   # colapso al 5% del precio de entrada
+  circuit_breaker_hours_left: 24    # solo si queda < 24h para resolución
+
+  # Umbrales de desacuerdo del ensemble — ADAPTATIVOS por horizonte (días).
+  # Forecasts a +7d divergen más legítimamente; usar tabla por bucket.
+  ensemble_std_max_by_days:
+    "1-3":
+      temperature_c: 3.0
+      precipitation_mm: 8.0
+      wind_mph: 6.0
+      snow_cm: 5.0
+    "4-5":
+      temperature_c: 5.0
+      precipitation_mm: 12.0
+      wind_mph: 9.0
+      snow_cm: 7.0
+    "6-7":
+      temperature_c: 7.0
+      precipitation_mm: 16.0
+      wind_mph: 12.0
+      snow_cm: 10.0
+  # Compat: tabla plana usada como fallback si el bucket no se encuentra.
+  ensemble_std_max:
+    temperature_c: 5.0
+    precipitation_mm: 12.0
+    wind_mph: 10.0
+    snow_cm: 8.0
+  # Relajado tras diagnóstico 29-Abr (3,426 NEAR_RESOLVED skips/ciclo).
+  # Con min_abs_edge=0.05, podemos permitir mercados más extremos sin riesgo
+  # adicional — la combinación filtra los trades realmente frágiles.
+  near_resolved_low: 0.05
+  near_resolved_high: 0.95
+  # Fuentes activas
+  sources:
+    open_meteo:     true
+    noaa_gfs:       true
+    ecmwf_open:     true
+    met_norway:     true
+    visual_crossing: true
+    openweathermap: true
+    weatherapi:     true
+    tomorrow_io:    true
+  # Pesos por defecto del ensemble — usados como fallback cuando no hay
+  # suficiente historia (>=5 trades) en `source_reliability` para esa source.
+  # Basado en la accuracy documentada de bots rentables (ECMWF/GFS/UKMO/NWS
+  # weighting estándar). Si una source acumula data, get_source_reliability_weights
+  # la sobreescribe con su Brier score real.
+  default_source_weights:
+    ecmwf_open:      0.30
+    noaa_gfs:        0.20
+    met_norway:      0.15
+    open_meteo:      0.10
+    visual_crossing: 0.10
+    weatherapi:      0.05
+    openweathermap:  0.05
+    tomorrow_io:     0.05
+
+# Pyramiding (múltiples entradas al mismo market) — controlado ahora por reeval_engine.
+pyramiding:
+  enabled: true
+  min_elapsed_minutes_since_last: 15
+  reject_if_existing_loss_pct: 0.15
+  cooldown_after_sl_hours: 2
 
 apis:
   gamma_base: "https://gamma-api.polymarket.com"
   clob_base: "https://clob.polymarket.com"
   cycle_delay_seconds: 0.5
+  source_timeout_seconds: 10
+  source_cache_ttl_seconds: 60
 
 claude:
-  model: "claude-sonnet-4-20250514"
-  max_tokens: 4096
-  temperature: 0.3
+  model: "claude-sonnet-4-6"
+  max_tokens: 2048
+  temperature: 0.2
 
 memory:
   history_context_size: 20
   analysis_after_close: true
   rule_extraction_every_n_cycles: 20
   parameter_adjustment_every_n_cycles: 20
-  min_trades_for_adjustments: 20
+  min_trades_for_adjustments: 15
   max_active_rules: 15
 
 dashboard:
   host: "0.0.0.0"
   port: 5000
-  refresh_interval_seconds: 60
+  refresh_interval_seconds: 30
 
 database:
   path: "data/bot.db"
@@ -64,3 +200,60 @@ database:
 logging:
   level: "INFO"
   log_dir: "logs"
+  events_file: "logs/events.jsonl"
+
+reports:
+  enabled: true
+  interval_minutes: 60
+  output_dir: "reports"
+
+notifications:
+  source_down_threshold: 3
+  anomaly_consecutive_losses: 3
+  anomaly_confidence: 85
+
+# ============================================================
+# Crypto-Lag MAKER Bot — módulo paralelo (Fase B del plan 29-Apr)
+# ------------------------------------------------------------
+# Estrategia: maker orders en mercados Polymarket BTC/ETH/SOL "Up or Down"
+# 15-min, usando Binance como referencia de precio. NO compite por velocidad
+# (latencia home internet 100-300ms); el edge viene de mejor modelo de
+# probabilidad (Black-Scholes digital + microstructure) vs el mid de Polymarket.
+#
+# Arrancar SIEMPRE en `enabled: false` y `mode: DEMO`. Validar 1 semana de
+# shadow P&L antes de pasar a LIVE con `max_order_usdc: 5`.
+# ============================================================
+crypto_lag:
+  enabled: true                 # OFF por defecto — activar tras validación
+  mode: DEMO                     # DEMO | LIVE — DEMO simula fills contra orderbook real
+  capital_pct: 0.30              # max % del bankroll que puede usar este módulo
+  symbols:
+    - { binance: BTCUSDT, polymarket_slug_pattern: "btc-up-or-down-*" }
+    - { binance: ETHUSDT, polymarket_slug_pattern: "eth-up-or-down-*" }
+    - { binance: SOLUSDT, polymarket_slug_pattern: "sol-up-or-down-*" }
+  binance:
+    # Puerto 9443 bloqueado en redes residenciales (ISP/firewall). El endpoint
+    # en 443 (default) funciona; vision es el espejo público de Binance.
+    ws_url: "wss://stream.binance.com/stream"
+    ws_url_fallback: "wss://data-stream.binance.vision/stream"
+    stale_seconds: 5             # gap el modelo si no llega tick en N s
+    reconnect_initial_seconds: 1
+    reconnect_max_seconds: 30
+  refresh_seconds: 3             # cadencia del cycle async
+  market_poll_seconds: 30        # cada cuánto refrescar lista de mercados activos
+  edge_threshold_cents: 2        # min edge (en cents de 0.01) para colocar maker
+  replace_threshold_cents: 1     # cancel-and-replace si drift > N cents
+  max_order_age_seconds: 30
+  max_order_usdc: 25             # tope por orden (LIVE: empezar en 5)
+  per_market_max_inventory_usdc: 100
+  kelly_fraction: 0.10
+  flatten_before_resolution_seconds: 30
+  imbalance_alpha: 0.03          # peso de book imbalance en el modelo de prob
+  poly_blend_weight: 0.10        # peso del mid de Polymarket en el blend final
+  paper:
+    q_toxic: 0.30                # frac de fills que asumimos son adverse-selection
+  circuit_breakers:
+    daily_max_loss_usdc: 50
+    consecutive_losses: 5
+    realized_vol_multiplier: 3.0
+    halt_file: "data/crypto_lag.halt"   # crear este archivo → para todo

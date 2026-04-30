@@ -2,12 +2,23 @@
 .env
 *.env
 
-# Database
+# Database & runtime data
 data/*.db
 data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+data/*.lock
+data/archive/
 
-# Logs
+# Logs & reports
 logs/*.log
+logs/*.jsonl
+logs/dashboard.log
+logs/archive/
+reports/
+
+# Claude Code
+.claude/
 
 # Python
 __pycache__/
