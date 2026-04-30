@@ -75,7 +75,10 @@ class MemorySystem:
 
     # ---- Component 2: Post-Trade Auto-Analysis ----
 
-    def analyze_closed_trade(self, trade: dict, claude_agent) -> dict:
+    def analyze_closed_trade(self, trade: dict, claude_agent=None) -> dict:
+        return {}
+
+    def _analyze_closed_trade_unused(self, trade: dict, claude_agent) -> dict:
         if not self.analysis_enabled:
             return {}
 
@@ -140,7 +143,10 @@ RESPONDE EN JSON:
     def should_extract_rules(self, cycle_count: int) -> bool:
         return cycle_count > 0 and cycle_count % self.rule_extraction_interval == 0
 
-    def extract_rules(self, claude_agent, force: bool = False) -> list[dict]:
+    def extract_rules(self, claude_agent=None, force: bool = False) -> list[dict]:
+        return []
+
+    def _extract_rules_unused(self, claude_agent, force: bool = False) -> list[dict]:
         analyses = self.db.get_recent_analyses(30)
         if not analyses and not force:
             logger.info("No analyses available for rule extraction")
@@ -238,7 +244,10 @@ RESPONDE EN JSON:
         stats = self.db.get_performance_summary()
         return stats.get("total_closed", 0) >= self.min_trades_for_adjustments
 
-    def suggest_parameter_adjustments(self, claude_agent, stats: dict, current_config: dict) -> list[dict]:
+    def suggest_parameter_adjustments(self, claude_agent=None, stats: dict = None, current_config: dict = None) -> list[dict]:
+        return []
+
+    def _suggest_parameter_adjustments_unused(self, claude_agent, stats: dict, current_config: dict) -> list[dict]:
         performance = self.db.get_performance_summary(50)
         adjustments_history = self.db.get_parameter_adjustments(10)
 

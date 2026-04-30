@@ -104,7 +104,7 @@ weather:
   # a < circuit_breaker_price_pct × entry_price Y quedan < circuit_breaker_hours_left
   # horas para resolución. Sirve para recuperar el pequeño residual antes de que
   # el mercado resuelva a 0. Activado tras diagnóstico 29-Abr (trade Seoul colapsado).
-  circuit_breaker_enabled: true
+  circuit_breaker_enabled: false
   circuit_breaker_price_pct: 0.05   # colapso al 5% del precio de entrada
   circuit_breaker_hours_left: 24    # solo si queda < 24h para resolución
 
@@ -167,7 +167,7 @@ pyramiding:
   enabled: true
   min_elapsed_minutes_since_last: 15
   reject_if_existing_loss_pct: 0.15
-  cooldown_after_sl_hours: 2
+  cooldown_after_sl_hours: 0
 
 apis:
   gamma_base: "https://gamma-api.polymarket.com"
@@ -227,6 +227,7 @@ crypto_lag:
   enabled: true                 # OFF por defecto — activar tras validación
   mode: DEMO                     # DEMO | LIVE — DEMO simula fills contra orderbook real
   capital_pct: 0.30              # max % del bankroll que puede usar este módulo
+  prefer_horizon_minutes: 5      # Polymarket usa 5m markets (no 15m)
   symbols:
     - { binance: BTCUSDT, polymarket_slug_pattern: "btc-up-or-down-*" }
     - { binance: ETHUSDT, polymarket_slug_pattern: "eth-up-or-down-*" }
