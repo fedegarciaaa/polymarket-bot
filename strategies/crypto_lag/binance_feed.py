@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Optional
 
@@ -35,6 +36,11 @@ except ImportError as e:
 from .state import MarketState
 
 logger = logging.getLogger("polymarket_bot.crypto_lag.feed")
+
+
+_BINANCE_REST = "https://api.binance.com/api/v3/klines"
+# Conservative fallback sigma when the REST bootstrap fails (~3% daily BTC vol).
+_FALLBACK_SIGMA = 0.03 / math.sqrt(86400)   # ≈ 1.02e-4 per √second
 
 
 class BinanceFeed:
@@ -61,10 +67,69 @@ class BinanceFeed:
         # On reconnect we mark all states stale — consumers will skip quoting
         # until we've had `2 * stale_seconds` of fresh data again.
         self._reconnect_freeze_until: float = 0.0
+        # Historical realized vol per symbol (sigma per √second), bootstrapped
+        # from Binance REST klines before the WS feed starts.
+        self._hist_sigma: dict[str, float] = {}
 
     @property
     def ws_url(self) -> str:
         return self._ws_urls[self._url_idx]
+
+    # ─── historical vol bootstrap ──────────────────────────────
+    async def bootstrap_historical_vol(
+        self, lookback_candles: int = 1440, interval: str = "1m"
+    ) -> None:
+        """Fetch `lookback_candles` of `interval` klines from Binance REST and
+        compute realized vol per √second for each symbol.
+
+        Must be called BEFORE start() so the probability model has a real sigma
+        from the very first tick instead of defaulting to 0.5 (no-vol fallback).
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            logger.warning("aiohttp not installed — skipping historical vol bootstrap")
+            for sym in self.symbols:
+                self._hist_sigma[sym] = _FALLBACK_SIGMA
+            return
+
+        from .probability_model import realized_vol_per_sqrt_s
+
+        async with aiohttp.ClientSession() as session:
+            for sym in self.symbols:
+                try:
+                    params = {"symbol": sym, "interval": interval, "limit": lookback_candles}
+                    async with session.get(_BINANCE_REST, params=params, timeout=15) as r:
+                        if r.status != 200:
+                            logger.warning(f"klines {sym}: HTTP {r.status}, using fallback σ")
+                            self._hist_sigma[sym] = _FALLBACK_SIGMA
+                            continue
+                        raw = await r.json()
+
+                    if len(raw) < 10:
+                        logger.warning(f"klines {sym}: only {len(raw)} candles, using fallback σ")
+                        self._hist_sigma[sym] = _FALLBACK_SIGMA
+                        continue
+
+                    # Each kline: [open_time_ms, open, high, low, close, volume, ...]
+                    # Use (open_time_seconds, close_price) for the vol function.
+                    history = [(float(k[0]) / 1000.0, float(k[4])) for k in raw]
+                    sigma = realized_vol_per_sqrt_s(history)
+                    sigma = max(sigma, _FALLBACK_SIGMA * 0.1)  # never go below 0.1× fallback
+                    self._hist_sigma[sym] = sigma
+
+                    daily_approx = sigma * math.sqrt(86400)
+                    logger.info(
+                        f"vol bootstrap {sym}: {len(history)} × {interval} candles → "
+                        f"σ={sigma:.2e}/√s  (≈{daily_approx:.1%} daily)"
+                    )
+                except Exception as exc:
+                    logger.warning(f"vol bootstrap {sym} failed: {exc} — using fallback σ")
+                    self._hist_sigma[sym] = _FALLBACK_SIGMA
+
+    def get_hist_sigma(self, symbol: str) -> float:
+        """Return bootstrapped historical vol for symbol, or conservative fallback."""
+        return self._hist_sigma.get(symbol.upper(), _FALLBACK_SIGMA)
 
     # ─── public surface ────────────────────────────────────────
     def get_state(self, symbol: str) -> Optional[MarketState]:

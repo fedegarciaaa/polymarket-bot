@@ -160,10 +160,22 @@ class CryptoLagCycle:
             self._heartbeat_snapshot(market, feed_state, now, decision="RESOLUTION_WINDOW")
             return
 
-        # 2c. Compute realized vol and run model
-        sigma = realized_vol_per_sqrt_s(list(feed_state.price_history))
-        # Keep sigma in a reasonable band (avoid divide-by-zero when history is
-        # short or perfectly flat — assume 1bp/sqrt(s) as a floor)
+        # 2c. Compute realized vol and run model.
+        # Blend realtime (WS ticks, ~5min window) with bootstrapped 24h kline vol:
+        # - < 60 realtime ticks (~1 min): use historical vol exclusively
+        # - 60-300 ticks: linear interpolation toward realtime
+        # - > 300 ticks: realtime dominates (sufficient in-session data)
+        rt_history = list(feed_state.price_history)
+        rt_sigma = realized_vol_per_sqrt_s(rt_history)
+        hist_sigma = self.feed.get_hist_sigma(market.symbol)
+        n_rt = len(rt_history)
+        if n_rt < 60:
+            sigma = hist_sigma
+        elif n_rt < 300:
+            alpha = (n_rt - 60) / (300 - 60)
+            sigma = (1.0 - alpha) * hist_sigma + alpha * rt_sigma
+        else:
+            sigma = rt_sigma
         sigma = max(sigma, 1e-5)
 
         # 2d. Pull Polymarket book from the executor's cache (it polls on its own)

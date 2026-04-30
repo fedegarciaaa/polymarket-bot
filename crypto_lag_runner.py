@@ -107,6 +107,9 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
     loop = asyncio.new_event_loop()
 
     async def _bootstrap_and_run():
+        # Fetch 24h of 1-minute klines from Binance REST before starting the WS
+        # so the probability model has real realized vol from tick 1.
+        await feed.bootstrap_historical_vol()
         await feed.start()
         await registry.start()
         await executor.start()
