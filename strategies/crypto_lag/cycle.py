@@ -61,6 +61,7 @@ class CryptoLagCycle:
         self.flatten_before_resolution = float(
             cfg.get("flatten_before_resolution_seconds", 30.0)
         )
+        self.max_book_spread = float(cfg.get("max_book_spread", 0.80))
         self.feed = feed
         self.registry = registry
         self.executor = executor
@@ -186,6 +187,12 @@ class CryptoLagCycle:
         poly_bid = float(book["best_bid"])
         poly_ask = float(book["best_ask"])
         poly_mid = 0.5 * (poly_bid + poly_ask)
+
+        # Gate: skip markets with no real liquidity (spread > 80 cents means
+        # essentially empty book — quoting at 0.02/0.98 will never fill).
+        if poly_ask - poly_bid > self.max_book_spread:
+            self._heartbeat_snapshot(market, feed_state, now, decision="NO_BOOK", sigma=sigma)
+            return
 
         inputs = ProbInputs(
             spot_now=feed_state.mid,
