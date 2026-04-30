@@ -106,14 +106,13 @@ class CryptoMarketRegistry:
     def active_for(
         self, symbol: str, now_ts: Optional[float] = None
     ) -> list[PolyCryptoMarket]:
-        """Return frozen `PolyCryptoMarket` records for `symbol` whose event
-        window is currently open (eventStartTime ≤ now < endDate).
+        """Return frozen `PolyCryptoMarket` records for `symbol` whose trading
+        window is currently open (startDate ≤ now < endDate).
 
-        IMPORTANT: rebuilds the frozen dataclass with the latest captured
-        strike from `self._strikes`. Previously the strike captured by the
-        cycle stayed in the dict but never propagated to the dataclass field,
-        so `market.strike_price` stayed at 0.0 forever and the cycle was stuck
-        in a "capture strike → return" loop without generating snapshots.
+        Polymarket crypto markets are created ~24h before the event window
+        (eventStartTime). We quote as soon as the market is open for trading
+        (startDate), capturing the current Binance price as the strike on first
+        sight. The model predicts direction over the full remaining horizon.
         """
         from dataclasses import replace
         now = now_ts or time.time()
@@ -124,10 +123,11 @@ class CryptoMarketRegistry:
             m = rec.market
             if m.end_ts <= now:
                 continue
-            # event-window check uses raw startDate-of-event; we stored it as a
-            # field-not-on-PolyCryptoMarket — keep the check on the raw record.
-            event_start = float(rec.raw.get("_event_start_ts", m.end_ts))
-            if event_start > now:
+            # Use startDate (when the market opened for trading) as the gate,
+            # not eventStartTime (when the measurement happens). Since we query
+            # Gamma with active=true the startDate condition is always met.
+            trade_start = float(rec.raw.get("_start_date_ts", 0.0))
+            if trade_start > now:
                 continue
             # Inject the latest captured strike (the registry holds it in a
             # separate dict). If we don't have one yet, leave 0.0 so the cycle
@@ -282,6 +282,9 @@ class CryptoMarketRegistry:
             "rewards_min_size_usdc": raw.get("rewardsMinSize"),
         }
 
+        start_date_ts = self._parse_iso(raw.get("startDate") or "")
+
         rec = _MarketInternal(symbol=symbol, market=market, raw=raw, fees=fees)
         rec.raw["_event_start_ts"] = event_start_ts
+        rec.raw["_start_date_ts"] = start_date_ts
         return rec

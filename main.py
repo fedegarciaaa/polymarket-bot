@@ -190,11 +190,7 @@ class TradingBot:
         self.memory = MemorySystem(self.db, config)
         self._last_report_at = 0.0
 
-        try:
-            self.claude = ClaudeAgent(config)
-        except ValueError as e:
-            self.logger.warning(f"Claude disabled: {e}")
-            self.claude = None
+        self.claude = None  # Claude removed from trading pipeline
 
         self.slog.log_system("bot_start", {
             "mode": self.mode, "shadow": self.shadow,
