@@ -422,14 +422,22 @@ class MakerOrderEngine:
         try:
             ext = await self.executor.place_order(order, market.token_yes)
             order.external_order_id = ext
-            self._open[cid][side] = order
+            # Re-create the per-cid bucket if `_cancel` above just removed it.
+            # `_cancel` calls `_open.pop(cid)` when the bucket becomes empty
+            # after the cancellation, so the assignment `_open[cid][side]`
+            # would otherwise KeyError on the cid hash. Using setdefault is
+            # idempotent: re-uses the existing dict if present, creates one
+            # otherwise.
+            self._open.setdefault(cid, {})[side] = order
             self.risk.on_order_open()
             logger.info(
                 f"placed {side} {market.symbol} {market.market_slug[:30]}: "
                 f"{size_usdc:.2f}@{price:.4f} (ext={ext})"
             )
         except Exception as exc:
-            logger.warning(f"place {side} {market.market_slug}: {exc}")
+            logger.warning(
+                f"place {side} {market.market_slug}: {type(exc).__name__}: {exc}"
+            )
 
     async def _cancel(self, condition_id: str, side: str) -> None:
         existing = self._open.get(condition_id, {}).get(side)
