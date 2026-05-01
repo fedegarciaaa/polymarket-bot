@@ -294,3 +294,22 @@ crypto_lag:
     consecutive_losses: 5
     realized_vol_multiplier: 3.0
     halt_file: "data/crypto_lag.halt"   # crear este archivo → para todo
+  # ─── Multi-variant shadow mode ───────────────────────────────
+  # Cada variant corre en paralelo en el mismo event loop (compartiendo
+  # feed Binance + registry Polymarket) pero con su propio simulator,
+  # engine y risk state. Las KPIs se loguean por separado en la DB
+  # (columna `variant`) y el dashboard muestra una sección por variant.
+  #
+  # Si quitas este bloque entero el runner cae al modo legacy con un
+  # único variant llamado "main" (compat hacia atras).
+  variants:
+    main: {}                     # usa los defaults de arriba (estricto, fiel)
+    permissive:
+      # Simulador optimista para validar la pipeline end-to-end (fills,
+      # closes, PnL, dashboard) cuando el flow real de Polymarket es escaso.
+      # NO PROMOCIONAR a LIVE en base a estos datos: relajan supuestos.
+      edge_threshold_cents: 1
+      replace_threshold_cents: 0.5
+      paper:
+        queue_position_enabled: false  # ignora cola: fills al cruzar precio
+        q_toxic: 0.10                  # menos fills marcados adverse

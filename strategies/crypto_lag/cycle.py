@@ -64,8 +64,20 @@ class CryptoLagCycle:
         db=None,
         notifier=None,
         deribit_iv=None,    # DeribitIVProvider | None
+        variant: str = "main",
+        variant_overrides: Optional[dict] = None,
     ):
-        cfg = config.get("crypto_lag", {}) or {}
+        # variant identifies this instance in DB / dashboard; e.g. "main" for
+        # the strict simulator and "permissive" for the optimistic shadow.
+        self.variant = str(variant)
+        # `variant_overrides` lets the runner inject per-variant params (e.g.
+        # edge_threshold, queue_position_enabled, ...) without mutating the
+        # shared `config` dict between siblings. Falls back to the legacy
+        # `crypto_lag` block when None.
+        cfg_global = config.get("crypto_lag", {}) or {}
+        cfg = dict(cfg_global)
+        if variant_overrides:
+            cfg.update(variant_overrides)
         self.refresh_seconds = float(cfg.get("refresh_seconds", 3.0))
         self.kelly_fraction = float(cfg.get("kelly_fraction", 0.10))
         self.imbalance_alpha = float(cfg.get("imbalance_alpha", 0.03))
@@ -530,7 +542,7 @@ class CryptoLagCycle:
                 fair_mid=0.5, edge_bid=0.0, edge_ask=0.0,
                 decision="PRE_EVENT",
             )
-            self.db.log_crypto_lag_snapshot(snap)
+            self._safe_log_snapshot(snap)
         except Exception as exc:
             logger.debug(f"symbol heartbeat error: {exc}")
 
@@ -561,7 +573,7 @@ class CryptoLagCycle:
                 fair_mid=0.5, edge_bid=0.0, edge_ask=0.0,
                 decision=decision,
             )
-            self.db.log_crypto_lag_snapshot(snap)
+            self._safe_log_snapshot(snap)
         except Exception as exc:
             logger.debug(f"heartbeat snapshot error: {exc}")
 
@@ -583,15 +595,29 @@ class CryptoLagCycle:
                 decision=decision.side,
             )
             if hasattr(self.db, "log_crypto_lag_snapshot"):
-                self.db.log_crypto_lag_snapshot(snap)
+                self._safe_log_snapshot(snap)
         except Exception:
             pass
+
+    def _safe_log_snapshot(self, snap) -> None:
+        """Log a snapshot tagged with this cycle's variant. Falls back to
+        the variant-less call if the DB is on the older schema/method
+        signature so an out-of-date deployment doesn't crash the cycle."""
+        try:
+            self.db.log_crypto_lag_snapshot(snap, variant=self.variant)
+        except TypeError:
+            self.db.log_crypto_lag_snapshot(snap)
 
     def _record_trade(self, fill, now) -> None:
         if self.db is None or not hasattr(self.db, "log_crypto_lag_fill"):
             return
         try:
-            self.db.log_crypto_lag_fill(fill)
+            # Older Database revisions don't accept the variant kwarg; fall
+            # back gracefully so we never crash the cycle on a logging call.
+            try:
+                self.db.log_crypto_lag_fill(fill, variant=self.variant)
+            except TypeError:
+                self.db.log_crypto_lag_fill(fill)
         except Exception:
             pass
 
@@ -599,7 +625,10 @@ class CryptoLagCycle:
         if self.db is None or not hasattr(self.db, "log_crypto_lag_close"):
             return
         try:
-            self.db.log_crypto_lag_close(ev)
+            try:
+                self.db.log_crypto_lag_close(ev, variant=self.variant)
+            except TypeError:
+                self.db.log_crypto_lag_close(ev)
         except Exception:
             pass
 

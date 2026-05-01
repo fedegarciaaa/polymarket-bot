@@ -267,7 +267,14 @@ class Database:
         self.conn.commit()
 
     def _create_crypto_lag_tables(self):
-        """Tables specific to the crypto-lag MAKER bot (Fase B). Idempotent."""
+        """Tables specific to the crypto-lag MAKER bot (Fase B). Idempotent.
+
+        v3 (May 2026 — shadow-mode): added `variant TEXT NOT NULL DEFAULT 'main'`
+        column to all three tables so we can run multiple instances of the bot
+        side-by-side (e.g. main = strict simulator, permissive = optimistic
+        simulator) without conflating their stats. Legacy DBs are migrated
+        in `_ensure_crypto_lag_variant_column()` below.
+        """
         c = self.conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS crypto_lag_quotes (
@@ -285,7 +292,8 @@ class Database:
                 fill_size_usdc REAL DEFAULT 0,
                 is_adverse INTEGER DEFAULT 0,
                 external_order_id TEXT,
-                local_order_id TEXT
+                local_order_id TEXT,
+                variant TEXT NOT NULL DEFAULT 'main'
             )
         """)
         c.execute("""
@@ -303,7 +311,8 @@ class Database:
                 poly_mid REAL,
                 edge_bid REAL,
                 edge_ask REAL,
-                decision TEXT
+                decision TEXT,
+                variant TEXT NOT NULL DEFAULT 'main'
             )
         """)
         c.execute("""
@@ -314,7 +323,8 @@ class Database:
                 symbol TEXT NOT NULL,
                 realized_pnl_usdc REAL NOT NULL,
                 final_yes_price REAL,
-                reason TEXT
+                reason TEXT,
+                variant TEXT NOT NULL DEFAULT 'main'
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_quotes_ts ON crypto_lag_quotes(ts)")
@@ -322,51 +332,83 @@ class Database:
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_snap_ts ON crypto_lag_state_snapshots(ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_close_ts ON crypto_lag_closes(ts)")
         self.conn.commit()
+        # Migrate legacy DBs that pre-date the `variant` column.
+        self._ensure_crypto_lag_variant_column()
+        # New indexes that require the variant column being present.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_clag_quotes_variant ON crypto_lag_quotes(variant, ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_clag_snap_variant ON crypto_lag_state_snapshots(variant, ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_clag_close_variant ON crypto_lag_closes(variant, ts)")
+        self.conn.commit()
 
-    def log_crypto_lag_fill(self, fill) -> None:
+    def _ensure_crypto_lag_variant_column(self) -> None:
+        """Add `variant` column to crypto_lag_* tables on legacy DBs.
+
+        SQLite ALTER TABLE ADD COLUMN is non-destructive and instantaneous,
+        so this is safe to run on every startup. We check existence first so
+        the migration is idempotent.
+        """
+        c = self.conn.cursor()
+        for table in ("crypto_lag_quotes", "crypto_lag_state_snapshots", "crypto_lag_closes"):
+            try:
+                c.execute(f"PRAGMA table_info({table})")
+                cols = {row["name"] for row in c.fetchall()}
+                if "variant" not in cols:
+                    # Default 'main' so historical rows are attributed to the
+                    # original (now legacy / strict) bot variant.
+                    c.execute(
+                        f"ALTER TABLE {table} ADD COLUMN variant TEXT NOT NULL DEFAULT 'main'"
+                    )
+                    logger.info(f"db migration: added 'variant' column to {table}")
+            except sqlite3.OperationalError as exc:
+                logger.warning(f"db migration {table}: {exc}")
+        self.conn.commit()
+
+    def log_crypto_lag_fill(self, fill, variant: str = "main") -> None:
         c = self.conn.cursor()
         c.execute(
             """INSERT INTO crypto_lag_quotes
                (ts, symbol, condition_id, side, outcome, price, size_usdc,
-                status, fill_price, fill_size_usdc, is_adverse, local_order_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                status, fill_price, fill_size_usdc, is_adverse, local_order_id, variant)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 float(fill.ts), fill.symbol, fill.condition_id,
                 fill.side, fill.outcome, float(fill.fill_price),
                 float(fill.fill_size_usdc), "filled",
                 float(fill.fill_price), float(fill.fill_size_usdc),
-                1 if fill.is_adverse else 0, fill.order_id,
+                1 if fill.is_adverse else 0, fill.order_id, str(variant),
             ),
         )
         self.conn.commit()
 
-    def log_crypto_lag_snapshot(self, snap) -> None:
+    def log_crypto_lag_snapshot(self, snap, variant: str = "main") -> None:
         c = self.conn.cursor()
         c.execute(
             """INSERT INTO crypto_lag_state_snapshots
                (ts, symbol, binance_mid, sigma_realized, book_imbalance,
                 p_model, fair_mid, poly_bid, poly_ask, poly_mid,
-                edge_bid, edge_ask, decision)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                edge_bid, edge_ask, decision, variant)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 float(snap.ts), snap.symbol, float(snap.binance_mid),
                 float(snap.sigma_realized), float(snap.book_imbalance),
                 float(snap.p_model), float(snap.fair_mid),
                 float(snap.poly_bid), float(snap.poly_ask), float(snap.poly_mid),
                 float(snap.edge_bid), float(snap.edge_ask), snap.decision,
+                str(variant),
             ),
         )
         self.conn.commit()
 
-    def log_crypto_lag_close(self, ev) -> None:
+    def log_crypto_lag_close(self, ev, variant: str = "main") -> None:
         c = self.conn.cursor()
         c.execute(
             """INSERT INTO crypto_lag_closes
-               (ts, condition_id, symbol, realized_pnl_usdc, final_yes_price, reason)
-               VALUES (?,?,?,?,?,?)""",
+               (ts, condition_id, symbol, realized_pnl_usdc, final_yes_price, reason, variant)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 float(ev.ts), ev.condition_id, ev.symbol,
                 float(ev.realized_pnl_usdc), float(ev.final_yes_price), ev.reason,
+                str(variant),
             ),
         )
         self.conn.commit()

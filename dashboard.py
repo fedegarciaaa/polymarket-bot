@@ -247,8 +247,73 @@ def _has_crypto_lag_tables(conn) -> bool:
         return False
 
 
+def _has_variant_column(conn) -> bool:
+    """Older DBs (pre-shadow-mode migration) lack the `variant` column. We
+    detect that and skip variant-filtering when absent so the dashboard keeps
+    working during a partial deploy / rollback."""
+    try:
+        rows = conn.execute("PRAGMA table_info(crypto_lag_state_snapshots)").fetchall()
+        return any(r["name"] == "variant" for r in rows)
+    except Exception:
+        return False
+
+
+def _variant_arg() -> str:
+    """Return the requested variant name from `?variant=X`, defaulting to
+    'main' so legacy clients (without the query param) keep getting the
+    primary bot's data."""
+    from flask import request
+    return str(request.args.get("variant", "main"))
+
+
+def _configured_variants() -> list[str]:
+    """Read the configured variant list from config.yaml.
+
+    Falls back to `['main']` if the user hasn't migrated to the
+    `crypto_lag.variants:` block yet."""
+    cfg = (CONFIG.get("crypto_lag") or {}).get("variants")
+    if isinstance(cfg, dict) and cfg:
+        return [str(k) for k in cfg.keys()]
+    return ["main"]
+
+
+@app.route("/api/crypto_lag/variants")
+def api_crypto_lag_variants():
+    """List all configured variants and how many snapshots/closes each one
+    has logged. Used by the dashboard JS to know which sections to render.
+    """
+    d = db()
+    out = []
+    has_var = _has_crypto_lag_tables(d.conn) and _has_variant_column(d.conn)
+    for v in _configured_variants():
+        rec = {"name": v, "snapshots": 0, "closes": 0, "fills_24h": 0}
+        if has_var:
+            try:
+                cutoff_24h = datetime.now(timezone.utc).timestamp() - 86400
+                rec["snapshots"] = d.conn.execute(
+                    "SELECT COUNT(*) AS n FROM crypto_lag_state_snapshots WHERE variant = ?",
+                    (v,),
+                ).fetchone()["n"] or 0
+                rec["closes"] = d.conn.execute(
+                    "SELECT COUNT(*) AS n FROM crypto_lag_closes WHERE variant = ?",
+                    (v,),
+                ).fetchone()["n"] or 0
+                rec["fills_24h"] = d.conn.execute(
+                    """SELECT COUNT(*) AS n FROM crypto_lag_quotes
+                       WHERE variant = ? AND status IN ('filled','partially_filled')
+                       AND ts >= ?""",
+                    (v, cutoff_24h),
+                ).fetchone()["n"] or 0
+            except Exception:
+                pass
+        out.append(rec)
+    d.close()
+    return jsonify({"variants": out})
+
+
 @app.route("/api/crypto_lag/health")
 def api_crypto_lag_health():
+    variant = _variant_arg()
     enabled = bool((CONFIG.get("crypto_lag") or {}).get("enabled"))
     symbols = [s.get("binance") for s in (CONFIG.get("crypto_lag") or {}).get("symbols", [])]
     capital_pct = float((CONFIG.get("crypto_lag") or {}).get("capital_pct", 0.30))
@@ -258,28 +323,47 @@ def api_crypto_lag_health():
     halted = Path(halt_path).exists()
     d = db()
     has_tables = _has_crypto_lag_tables(d.conn)
+    has_var = has_tables and _has_variant_column(d.conn)
     last_snap_ts = None
     last_decision = None
     recent_only_heartbeat = False
     if has_tables:
-        row = d.conn.execute(
-            "SELECT MAX(ts) AS ts FROM crypto_lag_state_snapshots"
-        ).fetchone()
-        last_snap_ts = row["ts"] if row and row["ts"] else None
-        # Sample the latest decision and check if the last 5 min has only
-        # heartbeat decisions (= we're alive but no real market in event window)
-        if last_snap_ts is not None:
-            last_row = d.conn.execute(
-                "SELECT decision FROM crypto_lag_state_snapshots ORDER BY ts DESC LIMIT 1"
+        if has_var:
+            row = d.conn.execute(
+                "SELECT MAX(ts) AS ts FROM crypto_lag_state_snapshots WHERE variant = ?",
+                (variant,),
             ).fetchone()
+        else:
+            row = d.conn.execute(
+                "SELECT MAX(ts) AS ts FROM crypto_lag_state_snapshots"
+            ).fetchone()
+        last_snap_ts = row["ts"] if row and row["ts"] else None
+        if last_snap_ts is not None:
+            if has_var:
+                last_row = d.conn.execute(
+                    "SELECT decision FROM crypto_lag_state_snapshots WHERE variant = ? ORDER BY ts DESC LIMIT 1",
+                    (variant,),
+                ).fetchone()
+            else:
+                last_row = d.conn.execute(
+                    "SELECT decision FROM crypto_lag_state_snapshots ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
             last_decision = last_row["decision"] if last_row else None
             cutoff = last_snap_ts - 300
-            mix = d.conn.execute(
-                """SELECT COUNT(*) AS n_quote
-                   FROM crypto_lag_state_snapshots
-                   WHERE ts >= ? AND decision IN ('BID','ASK','BOTH','NONE')""",
-                (cutoff,),
-            ).fetchone()
+            if has_var:
+                mix = d.conn.execute(
+                    """SELECT COUNT(*) AS n_quote
+                       FROM crypto_lag_state_snapshots
+                       WHERE variant = ? AND ts >= ? AND decision IN ('BID','ASK','BOTH','NONE')""",
+                    (variant, cutoff),
+                ).fetchone()
+            else:
+                mix = d.conn.execute(
+                    """SELECT COUNT(*) AS n_quote
+                       FROM crypto_lag_state_snapshots
+                       WHERE ts >= ? AND decision IN ('BID','ASK','BOTH','NONE')""",
+                    (cutoff,),
+                ).fetchone()
             recent_only_heartbeat = (mix["n_quote"] or 0) == 0
     d.close()
     return jsonify({
@@ -288,6 +372,7 @@ def api_crypto_lag_health():
         "capital_pct": capital_pct,
         "halted": halted,
         "tables_present": has_tables,
+        "variant": variant,
         "last_snapshot_ts": last_snap_ts,
         "last_decision": last_decision,
         "recent_only_heartbeat": recent_only_heartbeat,
@@ -297,42 +382,50 @@ def api_crypto_lag_health():
 
 @app.route("/api/crypto_lag/kpis")
 def api_crypto_lag_kpis():
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False})
+    has_var = _has_variant_column(d.conn)
     c = d.conn.cursor()
-    # 24h cutoff
     cutoff_24h = datetime.now(timezone.utc).timestamp() - 86400
     cutoff_1h = datetime.now(timezone.utc).timestamp() - 3600
+    # Build variant filter clauses inline so the queries stay readable.
+    vw = " AND variant = ?" if has_var else ""
+    vw_only = " WHERE variant = ?" if has_var else ""
+    vparams = (variant,) if has_var else ()
     pnl_total = c.execute(
-        "SELECT COALESCE(SUM(realized_pnl_usdc), 0) AS s FROM crypto_lag_closes"
+        f"SELECT COALESCE(SUM(realized_pnl_usdc), 0) AS s FROM crypto_lag_closes{vw_only}",
+        vparams,
     ).fetchone()["s"] or 0.0
     pnl_24h = c.execute(
-        "SELECT COALESCE(SUM(realized_pnl_usdc), 0) AS s FROM crypto_lag_closes WHERE ts >= ?",
-        (cutoff_24h,),
+        f"SELECT COALESCE(SUM(realized_pnl_usdc), 0) AS s FROM crypto_lag_closes WHERE ts >= ?{vw}",
+        (cutoff_24h, *vparams),
     ).fetchone()["s"] or 0.0
     closes_24h = c.execute(
-        "SELECT COUNT(*) AS n FROM crypto_lag_closes WHERE ts >= ?", (cutoff_24h,),
+        f"SELECT COUNT(*) AS n FROM crypto_lag_closes WHERE ts >= ?{vw}",
+        (cutoff_24h, *vparams),
     ).fetchone()["n"] or 0
     wins_24h = c.execute(
-        "SELECT COUNT(*) AS n FROM crypto_lag_closes WHERE ts >= ? AND realized_pnl_usdc > 0",
-        (cutoff_24h,),
+        f"SELECT COUNT(*) AS n FROM crypto_lag_closes WHERE ts >= ? AND realized_pnl_usdc > 0{vw}",
+        (cutoff_24h, *vparams),
     ).fetchone()["n"] or 0
     fills_24h = c.execute(
-        "SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND status IN ('filled','partially_filled')",
-        (cutoff_24h,),
+        f"SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND status IN ('filled','partially_filled'){vw}",
+        (cutoff_24h, *vparams),
     ).fetchone()["n"] or 0
     fills_1h = c.execute(
-        "SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND status IN ('filled','partially_filled')",
-        (cutoff_1h,),
+        f"SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND status IN ('filled','partially_filled'){vw}",
+        (cutoff_1h, *vparams),
     ).fetchone()["n"] or 0
     adverse_24h = c.execute(
-        "SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND is_adverse = 1",
-        (cutoff_24h,),
+        f"SELECT COUNT(*) AS n FROM crypto_lag_quotes WHERE ts >= ? AND is_adverse = 1{vw}",
+        (cutoff_24h, *vparams),
     ).fetchone()["n"] or 0
     capital_used = c.execute(
-        "SELECT COALESCE(SUM(fill_size_usdc), 0) AS s FROM crypto_lag_quotes WHERE status IN ('filled','partially_filled')"
+        f"SELECT COALESCE(SUM(fill_size_usdc), 0) AS s FROM crypto_lag_quotes WHERE status IN ('filled','partially_filled'){vw}",
+        vparams,
     ).fetchone()["s"] or 0.0
     d.close()
     win_rate = (wins_24h / closes_24h) if closes_24h > 0 else None
@@ -357,20 +450,33 @@ def api_crypto_lag_snapshots():
     from flask import request
     n = int(request.args.get("n", 200))
     minutes = int(request.args.get("minutes", 30))
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False, "by_symbol": {}})
+    has_var = _has_variant_column(d.conn)
     cutoff = datetime.now(timezone.utc).timestamp() - minutes * 60
-    rows = d.conn.execute(
-        """SELECT ts, symbol, binance_mid, sigma_realized, book_imbalance,
-                  p_model, fair_mid, poly_bid, poly_ask, poly_mid,
-                  edge_bid, edge_ask, decision
-           FROM crypto_lag_state_snapshots
-           WHERE ts >= ?
-           ORDER BY ts ASC""",
-        (cutoff,),
-    ).fetchall()
+    if has_var:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, binance_mid, sigma_realized, book_imbalance,
+                      p_model, fair_mid, poly_bid, poly_ask, poly_mid,
+                      edge_bid, edge_ask, decision
+               FROM crypto_lag_state_snapshots
+               WHERE ts >= ? AND variant = ?
+               ORDER BY ts ASC""",
+            (cutoff, variant),
+        ).fetchall()
+    else:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, binance_mid, sigma_realized, book_imbalance,
+                      p_model, fair_mid, poly_bid, poly_ask, poly_mid,
+                      edge_bid, edge_ask, decision
+               FROM crypto_lag_state_snapshots
+               WHERE ts >= ?
+               ORDER BY ts ASC""",
+            (cutoff,),
+        ).fetchall()
     d.close()
     by_symbol: dict = {}
     for r in rows:
@@ -386,16 +492,25 @@ def api_crypto_lag_snapshots():
 @app.route("/api/crypto_lag/decisions")
 def api_crypto_lag_decisions():
     """Distribution of decisions over the last 24h."""
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False})
+    has_var = _has_variant_column(d.conn)
     cutoff = datetime.now(timezone.utc).timestamp() - 86400
-    rows = d.conn.execute(
-        """SELECT decision, COUNT(*) AS n FROM crypto_lag_state_snapshots
-           WHERE ts >= ? GROUP BY decision""",
-        (cutoff,),
-    ).fetchall()
+    if has_var:
+        rows = d.conn.execute(
+            """SELECT decision, COUNT(*) AS n FROM crypto_lag_state_snapshots
+               WHERE ts >= ? AND variant = ? GROUP BY decision""",
+            (cutoff, variant),
+        ).fetchall()
+    else:
+        rows = d.conn.execute(
+            """SELECT decision, COUNT(*) AS n FROM crypto_lag_state_snapshots
+               WHERE ts >= ? GROUP BY decision""",
+            (cutoff,),
+        ).fetchall()
     d.close()
     return jsonify({
         "available": True,
@@ -406,16 +521,25 @@ def api_crypto_lag_decisions():
 @app.route("/api/crypto_lag/pnl_series")
 def api_crypto_lag_pnl_series():
     """Cumulative P&L series from the closes table — last 24h."""
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False, "points": []})
+    has_var = _has_variant_column(d.conn)
     cutoff = datetime.now(timezone.utc).timestamp() - 86400
-    rows = d.conn.execute(
-        """SELECT ts, realized_pnl_usdc FROM crypto_lag_closes
-           WHERE ts >= ? ORDER BY ts ASC""",
-        (cutoff,),
-    ).fetchall()
+    if has_var:
+        rows = d.conn.execute(
+            """SELECT ts, realized_pnl_usdc FROM crypto_lag_closes
+               WHERE ts >= ? AND variant = ? ORDER BY ts ASC""",
+            (cutoff, variant),
+        ).fetchall()
+    else:
+        rows = d.conn.execute(
+            """SELECT ts, realized_pnl_usdc FROM crypto_lag_closes
+               WHERE ts >= ? ORDER BY ts ASC""",
+            (cutoff,),
+        ).fetchall()
     d.close()
     points = []
     cum = 0.0
@@ -429,17 +553,28 @@ def api_crypto_lag_pnl_series():
 def api_crypto_lag_fills():
     from flask import request
     n = int(request.args.get("n", 25))
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False, "fills": []})
-    rows = d.conn.execute(
-        """SELECT ts, symbol, side, outcome, price, fill_size_usdc, fill_price, is_adverse
-           FROM crypto_lag_quotes
-           WHERE status IN ('filled','partially_filled')
-           ORDER BY ts DESC LIMIT ?""",
-        (n,),
-    ).fetchall()
+    has_var = _has_variant_column(d.conn)
+    if has_var:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, side, outcome, price, fill_size_usdc, fill_price, is_adverse
+               FROM crypto_lag_quotes
+               WHERE status IN ('filled','partially_filled') AND variant = ?
+               ORDER BY ts DESC LIMIT ?""",
+            (variant, n),
+        ).fetchall()
+    else:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, side, outcome, price, fill_size_usdc, fill_price, is_adverse
+               FROM crypto_lag_quotes
+               WHERE status IN ('filled','partially_filled')
+               ORDER BY ts DESC LIMIT ?""",
+            (n,),
+        ).fetchall()
     d.close()
     return jsonify({
         "available": True,
@@ -451,16 +586,27 @@ def api_crypto_lag_fills():
 def api_crypto_lag_closes():
     from flask import request
     n = int(request.args.get("n", 25))
+    variant = _variant_arg()
     d = db()
     if not _has_crypto_lag_tables(d.conn):
         d.close()
         return jsonify({"available": False, "closes": []})
-    rows = d.conn.execute(
-        """SELECT ts, symbol, condition_id, realized_pnl_usdc, final_yes_price, reason
-           FROM crypto_lag_closes
-           ORDER BY ts DESC LIMIT ?""",
-        (n,),
-    ).fetchall()
+    has_var = _has_variant_column(d.conn)
+    if has_var:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, condition_id, realized_pnl_usdc, final_yes_price, reason
+               FROM crypto_lag_closes
+               WHERE variant = ?
+               ORDER BY ts DESC LIMIT ?""",
+            (variant, n),
+        ).fetchall()
+    else:
+        rows = d.conn.execute(
+            """SELECT ts, symbol, condition_id, realized_pnl_usdc, final_yes_price, reason
+               FROM crypto_lag_closes
+               ORDER BY ts DESC LIMIT ?""",
+            (n,),
+        ).fetchall()
     d.close()
     return jsonify({
         "available": True,
@@ -521,6 +667,10 @@ HTML = """
   .reason-box{font-size:11px;color:#c9d1d9;background:#0d1117;border-left:3px solid #21262d;padding:4px 8px;margin-top:4px;white-space:pre-wrap;word-break:break-all}
 
   /* ─── Crypto-Lag section ─────────────────────────────────── */
+  .cl-variant-tag{display:inline-block;margin-left:10px;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;vertical-align:middle}
+  .cl-variant-tag[data-variant="main"]{background:#0d2615;color:#3fb950;border:1px solid #3fb95044}
+  .cl-variant-tag[data-variant="permissive"]{background:#1a1509;color:#d29922;border:1px solid #d2992244}
+  .cl-variant-tag[data-variant="aggressive"]{background:#1f0a09;color:#f85149;border:1px solid #f8514944}
   .cl-header{display:flex;flex-direction:column;gap:2px;margin-top:10px}
   .cl-icon{width:18px;height:18px;color:#f7931a;vertical-align:-3px;margin-right:6px}
   .cl-status-badge{margin-left:8px;display:inline-block;vertical-align:middle}
@@ -591,11 +741,17 @@ HTML = """
 <!-- ============================================================
      CRYPTO-LAG MAKER BOT SECTION
      Hidden by default; revealed when /api/crypto_lag/health says
-     tables_present=true (the bot has run with crypto_lag enabled
-     at least once, or DB has the tables). Enabled vs disabled is
-     reflected in the status badge.
+     tables_present=true. The first <section> (data-variant="main")
+     is the visible template; on load the JS clones it for every
+     extra variant configured in config.yaml under crypto_lag.variants
+     (e.g. "permissive") and stacks them below.
+
+     IDs inside the section have been replaced by data-cl="<role>"
+     attributes so the JS can resolve elements per-variant via
+     `section.querySelector('[data-cl="role"]')`.
      ============================================================ -->
-<section id="crypto-lag-section" style="display:none">
+<div id="cl-sections-container">
+<section class="crypto-lag-section" data-variant="main" id="crypto-lag-section" style="display:none">
   <hr class="divider">
   <div class="cl-header">
     <h2 style="margin-top:6px">
@@ -603,51 +759,53 @@ HTML = """
         <path d="M13 2 3 14h7l-1 8 10-12h-7z" fill="currentColor"/>
       </svg>
       Crypto-Lag MAKER Bot
-      <span id="cl-status" class="cl-status-badge" aria-live="polite"></span>
+      <span data-cl="variant-tag" class="cl-variant-tag"></span>
+      <span data-cl="status" class="cl-status-badge" aria-live="polite"></span>
     </h2>
-    <div id="cl-symbols-info" class="cl-sub muted">cargando…</div>
+    <div data-cl="symbols" class="cl-sub muted">cargando…</div>
   </div>
 
   <div class="cards cl-kpi-cards">
-    <div class="card" id="cl-kpi-pnl"><div class="label">P&amp;L Total</div><div class="value muted">—</div></div>
-    <div class="card" id="cl-kpi-fills"><div class="label">Fills 24h</div><div class="value muted">—</div></div>
-    <div class="card" id="cl-kpi-wr"><div class="label">Win Rate 24h</div><div class="value muted">—</div></div>
-    <div class="card" id="cl-kpi-cap"><div class="label">Capital Usado</div><div class="value muted">—</div></div>
+    <div class="card" data-cl="kpi-pnl"><div class="label">P&amp;L Total</div><div class="value muted">—</div></div>
+    <div class="card" data-cl="kpi-fills"><div class="label">Fills 24h</div><div class="value muted">—</div></div>
+    <div class="card" data-cl="kpi-wr"><div class="label">Win Rate 24h</div><div class="value muted">—</div></div>
+    <div class="card" data-cl="kpi-cap"><div class="label">Capital Usado</div><div class="value muted">—</div></div>
   </div>
 
   <div class="cl-grid">
     <div class="cl-chart-card">
       <div class="cl-chart-title">Drift de precio: Binance vs Polymarket implícito (30 min)</div>
-      <div class="cl-chart-body"><canvas id="cl-chart-price"></canvas></div>
+      <div class="cl-chart-body"><canvas data-cl="chart-price"></canvas></div>
     </div>
     <div class="cl-chart-card">
       <div class="cl-chart-title">Probabilidad: p_model (verde) vs poly_mid (azul punteado)</div>
-      <div class="cl-chart-body"><canvas id="cl-chart-prob"></canvas></div>
+      <div class="cl-chart-body"><canvas data-cl="chart-prob"></canvas></div>
     </div>
     <div class="cl-chart-card">
       <div class="cl-chart-title">P&amp;L acumulado (24h)</div>
       <div class="cl-chart-body" style="position:relative">
-        <canvas id="cl-chart-pnl"></canvas>
-        <div id="cl-pnl-empty" class="cl-empty-overlay">Sin closes todavía.</div>
+        <canvas data-cl="chart-pnl"></canvas>
+        <div data-cl="pnl-empty" class="cl-empty-overlay">Sin closes todavía.</div>
       </div>
     </div>
     <div class="cl-chart-card">
       <div class="cl-chart-title">Distribución de decisiones (24h)</div>
-      <div class="cl-chart-body cl-donut-body"><canvas id="cl-chart-decisions"></canvas></div>
+      <div class="cl-chart-body cl-donut-body"><canvas data-cl="chart-decisions"></canvas></div>
     </div>
   </div>
 
   <div class="grid2" style="margin-top:14px">
     <div>
       <h2>Fills recientes</h2>
-      <div id="cl-fills-table"></div>
+      <div data-cl="fills-table"></div>
     </div>
     <div>
       <h2>Closes recientes</h2>
-      <div id="cl-closes-table"></div>
+      <div data-cl="closes-table"></div>
     </div>
   </div>
 </section>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -904,24 +1062,28 @@ setInterval(refresh, 30000);
 
 /* =============================================================
    CRYPTO-LAG MAKER BOT — sección añadida 30-Apr-2026
-   Polling 5s. Si el módulo no está habilitado, oculta la sección.
+   v2 (May 2026): multi-variant. Una sección por variant configurada
+   en config.yaml `crypto_lag.variants:`. Cada sección es un clon del
+   template y se refresca de forma independiente, filtrando por
+   `?variant=<name>` en cada endpoint.
    ============================================================= */
 const CL = {
-  charts: { px: null, prob: null, pnl: null, dec: null },
+  // charts indexed by variant + role: CL.charts['main']['px']
+  charts: {},
   symbolColors: {
-    BTCUSDT: { line:'#f7931a', fill:'rgba(247,147,26,0.15)' },
-    ETHUSDT: { line:'#8b9eff', fill:'rgba(139,158,255,0.15)' },
-    SOLUSDT: { line:'#14f195', fill:'rgba(20,241,149,0.15)' },
+    BTCUSDT:  { line:'#f7931a', fill:'rgba(247,147,26,0.15)' },
+    ETHUSDT:  { line:'#8b9eff', fill:'rgba(139,158,255,0.15)' },
+    SOLUSDT:  { line:'#14f195', fill:'rgba(20,241,149,0.15)' },
+    BNBUSDT:  { line:'#f0b90b', fill:'rgba(240,185,11,0.15)' },
+    XRPUSDT:  { line:'#23292f', fill:'rgba(120,120,120,0.15)' },
+    DOGEUSDT: { line:'#c2a633', fill:'rgba(194,166,51,0.15)' },
   },
   fmtTime: t => new Date(t*1000).toLocaleTimeString(),
   fmtUsd:  v => (v>=0?'+':'') + '$' + Number(v).toFixed(2),
+  // discovered variants (ordered) — populated on startup
+  variants: ['main'],
+  bound: false,  // becomes true after we've cloned + bound all sections
 };
-
-function clEnsureChart(key, ctx, cfg){
-  if(CL.charts[key]) CL.charts[key].destroy();
-  CL.charts[key] = new Chart(ctx, cfg);
-  return CL.charts[key];
-}
 
 const clCommonOpts = {
   responsive: true,
@@ -938,15 +1100,76 @@ const clCommonOpts = {
   interaction: { mode:'index', intersect:false },
 };
 
-async function refreshCryptoLag(){
+/** Get the section element for a variant. */
+function clSection(variant){
+  return document.querySelector(`section.crypto-lag-section[data-variant="${variant}"]`);
+}
+
+/** Lookup an element inside a variant's section by its data-cl role. */
+function clEl(section, role){
+  return section.querySelector(`[data-cl="${role}"]`);
+}
+
+/** Store / replace a chart for (variant, role). */
+function clEnsureChart(variant, role, ctx, cfg){
+  CL.charts[variant] = CL.charts[variant] || {};
+  const old = CL.charts[variant][role];
+  if(old){ try{ old.destroy(); }catch(_){} }
+  CL.charts[variant][role] = new Chart(ctx, cfg);
+  return CL.charts[variant][role];
+}
+
+/** Clone the main section template for an extra variant and append it. */
+function clCloneSectionForVariant(variant){
+  if(variant === 'main') return;
+  if(clSection(variant)) return;  // already cloned
+  const tpl = clSection('main');
+  if(!tpl) return;
+  const clone = tpl.cloneNode(true);
+  clone.setAttribute('data-variant', variant);
+  clone.id = `crypto-lag-section-${variant}`;
+  // Reset any chart canvases in the clone — Chart.js will (re)attach on next render.
+  clone.querySelectorAll('canvas').forEach(c => { c.removeAttribute('id'); });
+  // Clear the dynamic table containers so we don't carry main's HTML over.
+  clone.querySelectorAll('[data-cl="fills-table"], [data-cl="closes-table"]').forEach(c => {
+    c.innerHTML = '';
+  });
+  // Reset KPI cards to their loading state
+  ['kpi-pnl','kpi-fills','kpi-wr','kpi-cap'].forEach(role => {
+    const el = clEl(clone, role);
+    if(!el) return;
+    const labelMap = {
+      'kpi-pnl':'P&L Total', 'kpi-fills':'Fills 24h',
+      'kpi-wr':'Win Rate 24h', 'kpi-cap':'Capital Usado',
+    };
+    el.innerHTML =
+      `<div class="label">${labelMap[role]}</div><div class="value muted">—</div>`;
+  });
+  tpl.parentNode.appendChild(clone);
+}
+
+/** Decorate the variant tag in the header. */
+function clSetVariantTag(section, variant){
+  const tag = clEl(section, 'variant-tag');
+  if(!tag) return;
+  tag.setAttribute('data-variant', variant);
+  // Friendly labels
+  const labels = { main: 'estricto', permissive: 'permisivo (validación)' };
+  tag.textContent = labels[variant] || variant;
+}
+
+async function refreshCryptoLag(variant){
+  variant = variant || 'main';
+  const section = clSection(variant);
+  if(!section) return;
   try {
-    const h = await fetch('/api/crypto_lag/health').then(r=>r.json());
-    const wrap = document.getElementById('crypto-lag-section');
-    if(!h.tables_present){ wrap.style.display='none'; return; }
-    wrap.style.display='block';
+    const h = await fetch(`/api/crypto_lag/health?variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    if(!h || !h.tables_present){ section.style.display='none'; return; }
+    section.style.display='block';
+    clSetVariantTag(section, variant);
 
     // Status badge
-    const status = $('cl-status');
+    const status = clEl(section, 'status');
     if(!h.enabled){
       status.innerHTML = '<span class="badge badge-amber">DISABLED</span>';
     } else if(h.halted){
@@ -962,58 +1185,55 @@ async function refreshCryptoLag(){
         status.innerHTML = '<span class="badge badge-green">LIVE</span>';
       }
     }
-    $('cl-symbols-info').textContent =
+    clEl(section, 'symbols').textContent =
       `${h.symbols.join(' · ')} · ${(h.capital_pct*100).toFixed(0)}% bankroll`;
 
     // KPIs
-    const k = await fetch('/api/crypto_lag/kpis').then(r=>r.json());
-    if(k.available){
+    const k = await fetch(`/api/crypto_lag/kpis?variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    if(k && k.available){
       const pnlClass = k.pnl_total_usdc >= 0 ? 'pos' : 'neg';
-      $('cl-kpi-pnl').innerHTML =
+      clEl(section, 'kpi-pnl').innerHTML =
         `<div class="label">P&amp;L Total</div><div class="value ${pnlClass}">${CL.fmtUsd(k.pnl_total_usdc)}</div>
          <div class="kpi-sub">24h: <span class="${k.pnl_24h_usdc>=0?'pos':'neg'}">${CL.fmtUsd(k.pnl_24h_usdc)}</span></div>`;
-      $('cl-kpi-fills').innerHTML =
+      clEl(section, 'kpi-fills').innerHTML =
         `<div class="label">Fills 24h</div><div class="value">${k.fills_24h}</div>
          <div class="kpi-sub">1h: ${k.fills_1h}${k.adverse_rate_24h!=null?` · adverse ${(k.adverse_rate_24h*100).toFixed(0)}%`:''}</div>`;
       const wr = k.win_rate_24h;
-      $('cl-kpi-wr').innerHTML =
+      clEl(section, 'kpi-wr').innerHTML =
         `<div class="label">Win Rate 24h</div>
          <div class="value ${wr==null?'muted':(wr>=0.5?'pos':'neg')}">${wr==null?'—':(wr*100).toFixed(0)+'%'}</div>
          <div class="kpi-sub">${k.wins_24h}W / ${k.closes_24h}T</div>`;
-      $('cl-kpi-cap').innerHTML =
+      clEl(section, 'kpi-cap').innerHTML =
         `<div class="label">Capital Usado</div><div class="value">$${k.capital_used_usdc.toFixed(0)}</div>
          <div class="kpi-sub muted">acumulado en fills</div>`;
     }
 
-    // Snapshots → chart de precios y prob
-    const snap = await fetch('/api/crypto_lag/snapshots?minutes=30&n=300').then(r=>r.json());
-    clRenderPriceChart(snap);
-    clRenderProbChart(snap);
+    // Charts + tables
+    const snap = await fetch(`/api/crypto_lag/snapshots?minutes=30&n=300&variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderPriceChart(variant, section, snap);
+    clRenderProbChart(variant, section, snap);
 
-    // P&L cumulative
-    const pnl = await fetch('/api/crypto_lag/pnl_series').then(r=>r.json());
-    clRenderPnlChart(pnl);
+    const pnl = await fetch(`/api/crypto_lag/pnl_series?variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderPnlChart(variant, section, pnl);
 
-    // Decisions distribution
-    const dec = await fetch('/api/crypto_lag/decisions').then(r=>r.json());
-    clRenderDecisionChart(dec);
+    const dec = await fetch(`/api/crypto_lag/decisions?variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderDecisionChart(variant, section, dec);
 
-    // Tables
-    const fills = await fetch('/api/crypto_lag/fills?n=12').then(r=>r.json());
-    clRenderFills(fills);
-    const closes = await fetch('/api/crypto_lag/closes?n=12').then(r=>r.json());
-    clRenderCloses(closes);
-  } catch(e){ console.warn('crypto_lag refresh:', e); }
+    const fills = await fetch(`/api/crypto_lag/fills?n=12&variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderFills(section, fills);
+    const closes = await fetch(`/api/crypto_lag/closes?n=12&variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderCloses(section, closes);
+  } catch(e){ console.warn(`crypto_lag[${variant}] refresh:`, e); }
 }
 
-function clRenderPriceChart(snap){
-  const ctx = document.getElementById('cl-chart-price').getContext('2d');
-  if(!snap.available || !Object.keys(snap.by_symbol||{}).length){
-    if(CL.charts.px){CL.charts.px.destroy();CL.charts.px=null;}
+function clRenderPriceChart(variant, section, snap){
+  const canvas = clEl(section, 'chart-price');
+  const ctx = canvas.getContext('2d');
+  if(!snap || !snap.available || !Object.keys(snap.by_symbol||{}).length){
+    const old = (CL.charts[variant]||{}).px;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].px; }
     return;
   }
-  // Build one normalized line per symbol — divide by first observed mid so all
-  // three crypto pairs fit on a single Y axis as % drift since session start.
   const datasets = [];
   Object.entries(snap.by_symbol).forEach(([sym, rows])=>{
     if(!rows.length) return;
@@ -1028,19 +1248,13 @@ function clRenderPriceChart(snap){
     datasets.push({
       label: sym + ' (Polymarket implied)',
       data: rows
-        // Drop points without a real Polymarket book (heartbeat snapshots
-        // store poly_mid=0 with decision=PRE_EVENT/GATED). Plotting those
-        // would create a flat line at -20% that pollutes the chart.
         .filter(r => r.poly_mid && r.poly_mid > 0 && r.decision !== 'PRE_EVENT')
-        .map(r => {
-          // Map poly_mid (probability) to a notional drift in %. 0.5 → 0%.
-          return { x: r.ts*1000, y: (r.poly_mid - 0.5) * 0.4 };
-        }),
+        .map(r => ({ x: r.ts*1000, y: (r.poly_mid - 0.5) * 0.4 })),
       borderColor: c.line, borderWidth: 1, borderDash: [4,3],
       pointRadius: 0, tension: 0.25, fill: false,
     });
   });
-  clEnsureChart('px', ctx, {
+  clEnsureChart(variant, 'px', ctx, {
     type: 'line',
     data: { datasets },
     options: {
@@ -1053,18 +1267,18 @@ function clRenderPriceChart(snap){
   });
 }
 
-function clRenderProbChart(snap){
-  const ctx = document.getElementById('cl-chart-prob').getContext('2d');
-  if(!snap.available){
-    if(CL.charts.prob){CL.charts.prob.destroy();CL.charts.prob=null;}
+function clRenderProbChart(variant, section, snap){
+  const canvas = clEl(section, 'chart-prob');
+  const ctx = canvas.getContext('2d');
+  if(!snap || !snap.available){
+    const old = (CL.charts[variant]||{}).prob;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].prob; }
     return;
   }
-  // Pick the symbol with the most data points — usually BTC. The user can
-  // visually compare p_model (our estimate) vs poly_mid (market) and the
-  // edge band between them.
   const entries = Object.entries(snap.by_symbol).sort((a,b)=>b[1].length-a[1].length);
   if(!entries.length){
-    if(CL.charts.prob){CL.charts.prob.destroy();CL.charts.prob=null;}
+    const old = (CL.charts[variant]||{}).prob;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].prob; }
     return;
   }
   const [sym, rows] = entries[0];
@@ -1082,7 +1296,7 @@ function clRenderProbChart(snap){
       pointRadius: 0, tension: 0.2, fill: false,
     },
   ];
-  clEnsureChart('prob', ctx, {
+  clEnsureChart(variant, 'prob', ctx, {
     type: 'line',
     data: { datasets },
     options: {
@@ -1095,18 +1309,21 @@ function clRenderProbChart(snap){
   });
 }
 
-function clRenderPnlChart(pnl){
-  const ctx = document.getElementById('cl-chart-pnl').getContext('2d');
-  if(!pnl.available || !pnl.points.length){
-    if(CL.charts.pnl){CL.charts.pnl.destroy();CL.charts.pnl=null;}
-    document.getElementById('cl-pnl-empty').style.display='flex';
+function clRenderPnlChart(variant, section, pnl){
+  const canvas = clEl(section, 'chart-pnl');
+  const ctx = canvas.getContext('2d');
+  const empty = clEl(section, 'pnl-empty');
+  if(!pnl || !pnl.available || !pnl.points.length){
+    const old = (CL.charts[variant]||{}).pnl;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].pnl; }
+    if(empty) empty.style.display='flex';
     return;
   }
-  document.getElementById('cl-pnl-empty').style.display='none';
+  if(empty) empty.style.display='none';
   const lastPnl = pnl.points[pnl.points.length-1].pnl_cum;
   const color = lastPnl >= 0 ? '#3fb950' : '#f85149';
   const fillColor = lastPnl >= 0 ? 'rgba(63,185,80,0.18)' : 'rgba(248,81,73,0.18)';
-  clEnsureChart('pnl', ctx, {
+  clEnsureChart(variant, 'pnl', ctx, {
     type: 'line',
     data: {
       datasets: [{
@@ -1126,28 +1343,27 @@ function clRenderPnlChart(pnl){
   });
 }
 
-function clRenderDecisionChart(dec){
-  const ctx = document.getElementById('cl-chart-decisions').getContext('2d');
-  if(!dec.available){
-    if(CL.charts.dec){CL.charts.dec.destroy();CL.charts.dec=null;}
+function clRenderDecisionChart(variant, section, dec){
+  const canvas = clEl(section, 'chart-decisions');
+  const ctx = canvas.getContext('2d');
+  if(!dec || !dec.available){
+    const old = (CL.charts[variant]||{}).dec;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].dec; }
     return;
   }
   const buckets = dec.buckets || {};
-  // Show all decision codes the cycle can emit. The first four are real
-  // quote actions; the rest are heartbeat statuses that mean "we're alive
-  // but waiting" (PRE_EVENT outside US trading hours, GATED by risk, etc).
   const labels  = ['BID','ASK','BOTH','NONE','PRE_EVENT','GATED','NO_BOOK','STRIKE_CAPTURED','RESOLUTION_WINDOW'];
   const colors  = ['#3fb950','#f85149','#79c0ff','#6e7681','#d29922','#a371f7','#39c5cf','#ff9b5e','#bb8009'];
-  // Filter out empty labels so the donut isn't cluttered
   const present = labels
     .map((l,i)=>({label:l, count: buckets[l] || 0, color: colors[i]}))
     .filter(x => x.count > 0);
   if(!present.length){
-    if(CL.charts.dec){CL.charts.dec.destroy();CL.charts.dec=null;}
-    ctx.canvas.parentElement.innerHTML = '<div class="cl-empty">Sin decisiones en 24h.</div>';
+    const old = (CL.charts[variant]||{}).dec;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].dec; }
+    canvas.parentElement.innerHTML = '<div class="cl-empty">Sin decisiones en 24h.</div>';
     return;
   }
-  clEnsureChart('dec', ctx, {
+  clEnsureChart(variant, 'dec', ctx, {
     type: 'doughnut',
     data: {
       labels: present.map(x=>x.label),
@@ -1164,9 +1380,9 @@ function clRenderDecisionChart(dec){
   });
 }
 
-function clRenderFills(payload){
-  const t = $('cl-fills-table');
-  const rows = payload.fills || [];
+function clRenderFills(section, payload){
+  const t = clEl(section, 'fills-table');
+  const rows = (payload && payload.fills) || [];
   if(!rows.length){ t.innerHTML = '<p class="cl-empty">Sin fills todavía.</p>'; return; }
   t.innerHTML = '<table><tr><th>Hora</th><th>Símbolo</th><th>Lado</th><th>Outcome</th><th>Precio</th><th>USDC</th><th>Adverse</th></tr>'
     + rows.map(r=>{
@@ -1185,9 +1401,9 @@ function clRenderFills(payload){
     + '</table>';
 }
 
-function clRenderCloses(payload){
-  const t = $('cl-closes-table');
-  const rows = payload.closes || [];
+function clRenderCloses(section, payload){
+  const t = clEl(section, 'closes-table');
+  const rows = (payload && payload.closes) || [];
   if(!rows.length){ t.innerHTML = '<p class="cl-empty">Sin closes todavía.</p>'; return; }
   t.innerHTML = '<table><tr><th>Hora</th><th>Símbolo</th><th>P&amp;L</th><th>Final</th><th>Razón</th></tr>'
     + rows.map(r=>{
@@ -1203,12 +1419,37 @@ function clRenderCloses(payload){
     + '</table>';
 }
 
+/** Discover variants from the server and clone the section for each extra one. */
+async function clDiscoverAndBindVariants(){
+  if(CL.bound) return;
+  try {
+    const res = await fetch('/api/crypto_lag/variants').then(r=>r.json());
+    const list = (res && res.variants && res.variants.map(v=>v.name)) || ['main'];
+    // Always include 'main' first (the visible template).
+    const ordered = ['main', ...list.filter(v => v !== 'main')];
+    CL.variants = ordered;
+    ordered.forEach(v => { if(v !== 'main') clCloneSectionForVariant(v); });
+    CL.bound = true;
+  } catch(e) {
+    console.warn('crypto_lag: variant discovery failed, using main only', e);
+    CL.variants = ['main'];
+    CL.bound = true;
+  }
+}
+
+async function refreshAllCryptoLagVariants(){
+  await clDiscoverAndBindVariants();
+  // Refresh all variants in parallel — they hit different DB rows so there's
+  // no contention.
+  await Promise.all(CL.variants.map(v => refreshCryptoLag(v)));
+}
+
 // Respect prefers-reduced-motion: if true, lower polling rate.
 const _clPrefersReduced = window.matchMedia &&
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const _clInterval = _clPrefersReduced ? 15000 : 5000;
-refreshCryptoLag();
-setInterval(refreshCryptoLag, _clInterval);
+refreshAllCryptoLagVariants();
+setInterval(refreshAllCryptoLagVariants, _clInterval);
 </script>
 </body>
 </html>
