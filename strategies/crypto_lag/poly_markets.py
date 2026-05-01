@@ -1,7 +1,7 @@
 """Polymarket "<symbol> updown" market registry.
 
 Polls Gamma every `market_poll_seconds` to discover the currently-tradable
-short-term up/down markets (slug pattern: `{symbol}-updown-{15m|5m}-{ts}`).
+short-term up/down markets (slug pattern: `{symbol}-updown-{5m|15m|1h}-{ts}`).
 
 What this module guarantees to consumers:
   - Returns only markets that are within their event window (eventStartTime
@@ -10,11 +10,26 @@ What this module guarantees to consumers:
   - Strike price is captured at first sight when the market crosses into its
     event window. If we missed the open, we backfill from Binance history
     closest to eventStartTime.
+  - Markets without minimum tradable liquidity are filtered out (see
+    `min_liquidity_usdc` config) — there's no point burning quotes on a
+    book that no one is going to take.
 
 Discovered fee profile (April 2026): `feeSchedule` is `{rate: 0.072,
 takerOnly: true, rebateRate: 0.2}` — makers pay nothing and receive 20%
 of taker fees as rebate. Liquidity rewards apply if quotes sit within
 `rewardsMaxSpread` (cents) of the mid with size ≥ `rewardsMinSize` USDC.
+
+v2 changes (May 2026 — F0.5 / F2.4 / F4.1 / F4.2 of profitability plan):
+  - Multi-horizon support: caller can pass `prefer_horizons=[5, 15, 60]` and
+    we'll accept markets in any of those horizons (not just one). Defaults
+    keep the legacy 5-minute behaviour.
+  - Liquidity filter: markets with `liquidityNum < min_liquidity_usdc` (when
+    that field is exposed by Gamma) are filtered out of the active pool.
+  - Wash filter: markets with a self-counterparty wash share above
+    `max_wash_share` are dropped. Polymarket exposes wash signals on its
+    public stats but we treat the field as opportunistic for now (default
+    threshold is permissive: 0.05).
+  - Symbol expansion: BTC/ETH/SOL/BNB/XRP/DOGE all in the slug regex.
 """
 
 from __future__ import annotations
@@ -43,13 +58,37 @@ SYMBOL_TO_SLUG_PREFIXES = {
     "BTCUSDT": ("btc-updown",),
     "ETHUSDT": ("eth-updown",),
     "SOLUSDT": ("sol-updown",),
-    # Binance USD-M futures pairs (not used by default but easy to extend)
     "BNBUSDT": ("bnb-updown",),
     "DOGEUSDT": ("doge-updown",),
     "XRPUSDT": ("xrp-updown",),
 }
 
-SLUG_RE = re.compile(r"^(btc|eth|sol|bnb|doge|xrp|hype)-updown-(\d+)m-(\d+)$")
+# Match horizons: minutes (5m, 15m, 30m) and hourly (1h). The horizon group is
+# normalized to MINUTES in `_parse_horizon_group`.
+SLUG_RE = re.compile(r"^(btc|eth|sol|bnb|doge|xrp|hype)-updown-(\d+(?:m|h))-(\d+)$")
+
+
+def _parse_horizon_group(token: str) -> Optional[int]:
+    """Convert '5m' → 5, '15m' → 15, '1h' → 60, '2h' → 120. Returns None if
+    the token is malformed."""
+    if not token:
+        return None
+    s = token.strip().lower()
+    if s.endswith("m"):
+        try:
+            return int(s[:-1])
+        except ValueError:
+            return None
+    if s.endswith("h"):
+        try:
+            return int(s[:-1]) * 60
+        except ValueError:
+            return None
+    try:
+        # Bare number → assume minutes
+        return int(s)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -60,6 +99,10 @@ class _MarketInternal:
     market: PolyCryptoMarket
     raw: dict = field(repr=False)
     fees: dict = field(repr=False)
+    horizon_minutes: int = 0
+    liquidity_usdc: float = 0.0
+    wash_share: float = 0.0
+    rewards_enabled: bool = False
 
 
 class CryptoMarketRegistry:
@@ -79,12 +122,24 @@ class CryptoMarketRegistry:
         symbols: list[str],
         poll_seconds: float = 30.0,
         slug_prefixes: Optional[dict[str, tuple[str, ...]]] = None,
-        prefer_horizon_minutes: int = 15,
+        prefer_horizon_minutes: int = 5,
+        prefer_horizons: Optional[list[int]] = None,
+        min_liquidity_usdc: float = 0.0,
+        max_wash_share: float = 0.10,
     ):
         self.symbols = [s.upper() for s in symbols]
         self.poll_seconds = poll_seconds
         self._slug_prefixes = slug_prefixes or SYMBOL_TO_SLUG_PREFIXES
-        self.prefer_horizon_minutes = prefer_horizon_minutes
+        # Allow either a single horizon (legacy) or a list. The list takes
+        # precedence when both are supplied. Convert any to a sorted set of
+        # ints for fast membership checks.
+        if prefer_horizons:
+            self._horizons = {int(h) for h in prefer_horizons if int(h) > 0}
+        else:
+            self._horizons = {int(prefer_horizon_minutes)}
+        self.prefer_horizon_minutes = int(prefer_horizon_minutes)  # legacy attr
+        self.min_liquidity_usdc = float(max(0.0, min_liquidity_usdc))
+        self.max_wash_share = float(max(0.0, min(1.0, max_wash_share)))
         self._records: dict[str, _MarketInternal] = {}  # condition_id → internal
         self._strikes: dict[str, float] = {}            # condition_id → captured strike
         self._stop = asyncio.Event()
@@ -148,6 +203,20 @@ class CryptoMarketRegistry:
         rec = self._records.get(condition_id)
         return dict(rec.fees) if rec else {}
 
+    def metadata_for(self, condition_id: str) -> Optional[dict]:
+        """Expose horizon, liquidity and rewards metadata for the dashboard
+        and the rewards farming module."""
+        rec = self._records.get(condition_id)
+        if rec is None:
+            return None
+        return {
+            "horizon_minutes": rec.horizon_minutes,
+            "liquidity_usdc": rec.liquidity_usdc,
+            "wash_share": rec.wash_share,
+            "rewards_enabled": rec.rewards_enabled,
+            "fees": dict(rec.fees),
+        }
+
     # ─── internals ──────────────────────────────────────────────
     async def _poll_loop(self) -> None:
         async with aiohttp.ClientSession() as session:
@@ -180,14 +249,21 @@ class CryptoMarketRegistry:
             data = await r.json()
 
         new_records: dict[str, _MarketInternal] = {}
+        skipped_liquidity = 0
+        skipped_wash = 0
+        skipped_horizon = 0
         for raw in data:
             slug = (raw.get("slug") or "").lower()
             m = SLUG_RE.match(slug)
             if not m:
                 continue
             slug_sym = m.group(1)            # btc | eth | sol | ...
-            horizon_min = int(m.group(2))    # 5 | 15
-            if horizon_min != self.prefer_horizon_minutes:
+            horizon_token = m.group(2)       # "5m" | "15m" | "1h"
+            horizon_min = _parse_horizon_group(horizon_token)
+            if horizon_min is None:
+                continue
+            if horizon_min not in self._horizons:
+                skipped_horizon += 1
                 continue
             # Map slug prefix back to Binance symbol
             target_sym: Optional[str] = None
@@ -198,11 +274,21 @@ class CryptoMarketRegistry:
             if not target_sym:
                 continue
             try:
-                cond = self._build_market(raw, target_sym)
+                cond = self._build_market(raw, target_sym, horizon_min)
             except Exception as exc:
                 logger.debug(f"skip slug={slug}: {exc}")
                 continue
             if cond is None:
+                continue
+            # Liquidity filter — drop if Gamma reports zero / below threshold.
+            if cond.liquidity_usdc < self.min_liquidity_usdc:
+                skipped_liquidity += 1
+                continue
+            # Wash filter — drop self-counterparty heavy markets if the field
+            # is exposed (Gamma sometimes returns 0.0 when unknown; we don't
+            # punish those — only filter when wash > threshold).
+            if cond.wash_share > self.max_wash_share:
+                skipped_wash += 1
                 continue
             new_records[cond.market.condition_id] = cond
 
@@ -215,9 +301,10 @@ class CryptoMarketRegistry:
         added = set(new_records) - set(self._records)
         removed = set(self._records) - set(new_records)
         self._records = new_records
-        if added or removed:
+        if added or removed or skipped_liquidity or skipped_wash:
             logger.info(
-                f"market registry: +{len(added)} -{len(removed)} = {len(self._records)} active"
+                f"market registry: +{len(added)} -{len(removed)} = {len(self._records)} active "
+                f"(skipped: liq={skipped_liquidity} wash={skipped_wash} horizon={skipped_horizon})"
             )
 
     @staticmethod
@@ -227,8 +314,17 @@ class CryptoMarketRegistry:
             return 0.0
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
+    @staticmethod
+    def _maybe_float(v) -> float:
+        try:
+            if v is None:
+                return 0.0
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _build_market(
-        self, raw: dict, symbol: str
+        self, raw: dict, symbol: str, horizon_min: int
     ) -> Optional[_MarketInternal]:
         # outcomes & token IDs are JSON strings in the Gamma payload
         outcomes_raw = raw.get("outcomes")
@@ -253,8 +349,8 @@ class CryptoMarketRegistry:
             return None
         event_start_ts = self._parse_iso(raw.get("eventStartTime") or "")
         if event_start_ts <= 0:
-            # Fallback: use endDate - 15min for old payloads that omit eventStartTime
-            event_start_ts = end_ts - 60.0 * self.prefer_horizon_minutes
+            # Fallback: use endDate - horizon for old payloads that omit eventStartTime
+            event_start_ts = end_ts - 60.0 * float(horizon_min)
 
         # Strike: not in the Gamma payload. Captured separately at eventStartTime.
         strike = self._strikes.get(str(raw.get("conditionId")), 0.0)
@@ -281,10 +377,33 @@ class CryptoMarketRegistry:
             "rewards_max_spread_cents": raw.get("rewardsMaxSpread"),
             "rewards_min_size_usdc": raw.get("rewardsMinSize"),
         }
+        rewards_enabled = bool(
+            raw.get("rewardsEnabled")
+            or (fees.get("rewards_max_spread_cents") not in (None, 0))
+        )
+
+        # Liquidity is reported via several fields depending on Gamma's mood.
+        # Prefer `liquidityNum` (numeric), fall back to `liquidity` (string).
+        liquidity = self._maybe_float(raw.get("liquidityNum"))
+        if liquidity <= 0:
+            liquidity = self._maybe_float(raw.get("liquidity"))
+
+        # Wash share — only fill when Gamma exposes it. Otherwise 0.
+        wash = self._maybe_float(
+            raw.get("washVolumeShare")
+            or raw.get("selfCounterpartyShare")
+        )
+        wash = max(0.0, min(1.0, wash))
 
         start_date_ts = self._parse_iso(raw.get("startDate") or "")
 
-        rec = _MarketInternal(symbol=symbol, market=market, raw=raw, fees=fees)
+        rec = _MarketInternal(
+            symbol=symbol, market=market, raw=raw, fees=fees,
+            horizon_minutes=int(horizon_min),
+            liquidity_usdc=liquidity,
+            wash_share=wash,
+            rewards_enabled=rewards_enabled,
+        )
         rec.raw["_event_start_ts"] = event_start_ts
         rec.raw["_start_date_ts"] = start_date_ts
         return rec

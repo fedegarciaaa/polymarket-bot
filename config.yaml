@@ -227,11 +227,24 @@ crypto_lag:
   enabled: true                 # OFF por defecto — activar tras validación
   mode: DEMO                     # DEMO | LIVE — DEMO simula fills contra orderbook real
   capital_pct: 0.30              # max % del bankroll que puede usar este módulo
-  prefer_horizon_minutes: 5      # Polymarket usa 5m markets (no 15m)
+  # Multi-horizonte: aceptamos markets 5m, 15m y 1h. El de 5m tiene mejor edge
+  # pero menos liquidez; 15m y 1h equilibran. Si quieres uno solo, deja
+  # `prefer_horizons: [5]` y vacía el resto.
+  prefer_horizon_minutes: 5      # legacy (single-horizon), sólo si prefer_horizons no está
+  prefer_horizons: [5, 15, 60]   # minutos. 60 = 1h
+  # Filtro de liquidez (USDC). Markets con liquidityNum < N se descartan.
+  # 0 = sin filtro (acepta todo). 500-1000 es razonable para que el book exista.
+  min_liquidity_usdc: 0
+  max_wash_share: 0.10           # descartar markets con wash > 10% (cuando Gamma lo expone)
   symbols:
-    - { binance: BTCUSDT, polymarket_slug_pattern: "btc-up-or-down-*" }
-    - { binance: ETHUSDT, polymarket_slug_pattern: "eth-up-or-down-*" }
-    - { binance: SOLUSDT, polymarket_slug_pattern: "sol-up-or-down-*" }
+    - { binance: BTCUSDT,  polymarket_slug_pattern: "btc-updown-*" }
+    - { binance: ETHUSDT,  polymarket_slug_pattern: "eth-updown-*" }
+    - { binance: SOLUSDT,  polymarket_slug_pattern: "sol-updown-*" }
+    # Símbolos extras (F4.1). Si Polymarket no tiene markets para alguno
+    # estos no harán nada, no es problema.
+    - { binance: BNBUSDT,  polymarket_slug_pattern: "bnb-updown-*" }
+    - { binance: XRPUSDT,  polymarket_slug_pattern: "xrp-updown-*" }
+    - { binance: DOGEUSDT, polymarket_slug_pattern: "doge-updown-*" }
   binance:
     # Puerto 9443 bloqueado en redes residenciales (ISP/firewall). El endpoint
     # en 443 (default) funciona; vision es el espejo público de Binance.
@@ -247,12 +260,35 @@ crypto_lag:
   max_order_age_seconds: 30
   max_order_usdc: 25             # tope por orden (LIVE: empezar en 5)
   per_market_max_inventory_usdc: 100
+  max_concurrent_orders: 12      # con two-sided podemos abrir 2 por market
   kelly_fraction: 0.10
-  flatten_before_resolution_seconds: 30
-  imbalance_alpha: 0.03          # peso de book imbalance en el modelo de prob
+  flatten_before_resolution_seconds: 10  # F1.5: cancel all en últimos 10s
+  imbalance_alpha: 0.03          # peso de book imbalance Binance en el modelo
+  poly_obi_alpha: 0.02           # peso de OBI Polymarket (own-book)
   poly_blend_weight: 0.10        # peso del mid de Polymarket en el blend final
+  # F1.1 — composición de volatilidad (deben sumar ~1.0; weights se renormalizan
+  # si alguna fuente está ausente).
+  vol_blend_weights:
+    realized: 0.5                # EWMA sobre ticks Binance
+    iv: 0.3                      # Deribit ATM IV (BTC/ETH/SOL nativos, otros via proxy)
+    garch: 0.2                   # GARCH(1,1) one-step ahead
+  realized_vol_mode: ewma        # "ewma" o "plain"
+  ewma_lambda: 0.94              # RiskMetrics constant
+  # F2.1 — Avellaneda-Stoikov tunables
+  two_sided_quoting: true        # cotizar BID y ASK simultáneamente
+  gamma: 0.10                    # risk aversion (0.05–0.20 razonable)
+  arrival_intensity_k: 1.5       # order-arrival intensity (calibrar c/datos)
+  inventory_skew_threshold: 0.7  # |q|/q_max > 0.7 → bloquear el lado que profundiza
+  # F0.4 — fee model
+  fee_rate: 0.072                # Polymarket crypto fee curve (peak 1.80% en p=0.5)
+  maker_rebate_share: 0.20       # 20% del fee al maker como rebate
+  # Deribit IV puller (F1.1)
+  deribit:
+    enabled: true
+    refresh_seconds: 300         # IV no se mueve rápido; 5min es de sobra
   paper:
     q_toxic: 0.30                # frac de fills que asumimos son adverse-selection
+    queue_position_enabled: true # F0.2 — modelar cola realista
   circuit_breakers:
     daily_max_loss_usdc: 50
     consecutive_losses: 5

@@ -6,9 +6,10 @@ risk together. Each tick:
   1. Read feed snapshots and orderbook from cached state.
   2. For each active market in event window:
      a. Capture strike if not yet known (snap from feed at first sight).
-     b. Compute realized vol from rolling history.
+     b. Compose realized + implied + GARCH vol into a single sigma.
      c. Run probability_model.prob_up.
-     d. Compare model fair_mid to Polymarket bid/ask, build QuoteDecision.
+     d. Compare model fair_mid to Polymarket bid/ask, build a two-sided
+        QuoteDecision (Avellaneda-Stoikov + fee-aware + inventory-skew).
      e. Reconcile via order_engine.
   3. Poll executor for fills, update risk inventory, log to DB.
   4. Resolve any markets whose endDate passed: settle position with the actual
@@ -21,17 +22,19 @@ This task runs forever; cancel via the runner's stop event.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import math
 import time
 from typing import Optional
 
 from .binance_feed import BinanceFeed
+from .garch import Garch11, returns_from_prices
 from .order_engine import MakerOrderEngine, QuoteDecision
 from .paper_executor import PaperExecutor
 from .poly_markets import CryptoMarketRegistry
 from .probability_model import (
     ProbInputs,
+    blend_volatility,
     prob_up,
     realized_vol_per_sqrt_s,
 )
@@ -39,6 +42,14 @@ from .risk import CryptoLagRisk
 from .state import CryptoLagSnapshot, PolyCryptoMarket
 
 logger = logging.getLogger("polymarket_bot.crypto_lag.cycle")
+
+
+# Late-window phases (seconds remaining until endDate). Tuned per Substack
+# benjamin.bigdev observation that 85% of the resolution direction is decided
+# in the last 10 seconds of a 5-min market.
+LATE_WINDOW_TIGHTEN_S = 60.0    # T ∈ (30, 60]: tighten spread, allow new quotes
+LATE_WINDOW_HOLD_S = 30.0       # T ∈ (10, 30]: don't place new orders, hold existing
+LATE_WINDOW_FLAT_S = 10.0       # T ≤ 10: cancel all, flat
 
 
 class CryptoLagCycle:
@@ -52,16 +63,32 @@ class CryptoLagCycle:
         risk: CryptoLagRisk,
         db=None,
         notifier=None,
+        deribit_iv=None,    # DeribitIVProvider | None
     ):
         cfg = config.get("crypto_lag", {}) or {}
         self.refresh_seconds = float(cfg.get("refresh_seconds", 3.0))
         self.kelly_fraction = float(cfg.get("kelly_fraction", 0.10))
         self.imbalance_alpha = float(cfg.get("imbalance_alpha", 0.03))
         self.poly_blend_weight = float(cfg.get("poly_blend_weight", 0.10))
+        self.poly_obi_alpha = float(cfg.get("poly_obi_alpha", 0.02))
         self.flatten_before_resolution = float(
-            cfg.get("flatten_before_resolution_seconds", 30.0)
+            cfg.get("flatten_before_resolution_seconds", LATE_WINDOW_FLAT_S)
         )
         self.max_book_spread = float(cfg.get("max_book_spread", 0.80))
+        self.use_two_sided = bool(cfg.get("two_sided_quoting", True))
+
+        # Volatility blend weights (realized vs IV vs GARCH). Defaults follow
+        # the F1.1 plan: 0.5 realized, 0.3 IV, 0.2 GARCH.
+        vbw = cfg.get("vol_blend_weights") or {}
+        self.vol_weights = {
+            "realized": float(vbw.get("realized", 0.5)),
+            "iv": float(vbw.get("iv", 0.3)),
+            "garch": float(vbw.get("garch", 0.2)),
+        }
+        # Whether to use EWMA on the rolling realized vol (recommended).
+        self.realized_mode = str(cfg.get("realized_vol_mode", "ewma"))
+        self.ewma_lambda = float(cfg.get("ewma_lambda", 0.94))
+
         self.feed = feed
         self.registry = registry
         self.executor = executor
@@ -69,9 +96,15 @@ class CryptoLagCycle:
         self.risk = risk
         self.db = db
         self.notifier = notifier
+        self.deribit_iv = deribit_iv
         self._stop = asyncio.Event()
         # Per-market heartbeat rate limit (condition_id → last snapshot ts)
         self._last_heartbeat_ts: dict[str, float] = {}
+        # Per-symbol GARCH(1,1) instances. Lazily initialized on first use so
+        # we don't pay the warm-up cost for symbols with no active markets.
+        self._garch: dict[str, Garch11] = {}
+        # Last hour-bucket we refit GARCH on, so we refit at most once per hour.
+        self._garch_last_refit_hour: dict[str, int] = {}
 
     async def run_forever(self) -> None:
         logger.info("crypto_lag cycle started")
@@ -117,12 +150,12 @@ class CryptoLagCycle:
             feed_state = self.feed.get_state(sym)
             if feed_state is None:
                 continue
+            # GARCH housekeeping (refit at most once per hour per symbol)
+            self._refit_garch_if_due(sym, now)
             markets = self.registry.active_for(sym, now)
             if not markets:
                 # No market in its event window → emit a per-symbol heartbeat
                 # so the dashboard can show binance_mid and "PRE_EVENT" status.
-                # Polymarket crypto-updown markets only open during US trading
-                # hours; the heartbeat keeps the chart populated outside that window.
                 self._symbol_heartbeat(sym, feed_state, now)
                 continue
             for market in markets:
@@ -154,30 +187,18 @@ class CryptoLagCycle:
             return  # next tick will quote with strike known
 
         t_remaining = market.end_ts - now
+
+        # 2b.1 Late-window policy: cancel everything in the flat zone.
         if t_remaining <= self.flatten_before_resolution:
-            # Stop quoting in the resolution window — let any open orders die
-            # (or be filled at face value) instead of replacing.
             await self.engine.cancel_all_for(market.condition_id)
-            self._heartbeat_snapshot(market, feed_state, now, decision="RESOLUTION_WINDOW")
+            self._heartbeat_snapshot(
+                market, feed_state, now,
+                decision="RESOLUTION_WINDOW",
+            )
             return
 
-        # 2c. Compute realized vol and run model.
-        # Blend realtime (WS ticks, ~5min window) with bootstrapped 24h kline vol:
-        # - < 60 realtime ticks (~1 min): use historical vol exclusively
-        # - 60-300 ticks: linear interpolation toward realtime
-        # - > 300 ticks: realtime dominates (sufficient in-session data)
-        rt_history = list(feed_state.price_history)
-        rt_sigma = realized_vol_per_sqrt_s(rt_history)
-        hist_sigma = self.feed.get_hist_sigma(market.symbol)
-        n_rt = len(rt_history)
-        if n_rt < 60:
-            sigma = hist_sigma
-        elif n_rt < 300:
-            alpha = (n_rt - 60) / (300 - 60)
-            sigma = (1.0 - alpha) * hist_sigma + alpha * rt_sigma
-        else:
-            sigma = rt_sigma
-        sigma = max(sigma, 1e-5)
+        # 2c. Compose realized + IV + GARCH into one σ-per-√s
+        sigma = self._compose_sigma(market.symbol, feed_state, now)
 
         # 2d. Pull Polymarket book from the executor's cache (it polls on its own)
         book = await self.executor._get_book(market.token_yes)  # noqa: SLF001
@@ -194,6 +215,9 @@ class CryptoLagCycle:
             self._heartbeat_snapshot(market, feed_state, now, decision="NO_BOOK", sigma=sigma)
             return
 
+        # 2e. Polymarket-side OBI (own-book imbalance, separate from Binance).
+        poly_obi = _book_imbalance(book.get("bid_size", 0.0), book.get("ask_size", 0.0))
+
         inputs = ProbInputs(
             spot_now=feed_state.mid,
             strike=market.strike_price,
@@ -202,39 +226,84 @@ class CryptoLagCycle:
             book_imbalance=feed_state.book_imbalance,
             trade_flow_5s=feed_state.trade_flow_5s,
             poly_mid=poly_mid,
+            poly_book_imbalance=poly_obi,
         )
         out = prob_up(
             inputs,
             imbalance_alpha=self.imbalance_alpha,
             poly_blend_weight=self.poly_blend_weight,
+            poly_obi_alpha=self.poly_obi_alpha,
         )
         fair_mid = out.p_blended
 
-        # 2e. Sizing — Kelly on the larger edge
+        # 2f. Sizing — Kelly on the larger gross edge (rebate is added inside
+        # the engine's net-edge check, so the *threshold* for sizing here is
+        # generous on purpose).
         edge = max(fair_mid - poly_bid, poly_ask - fair_mid)
         kelly_size = self._kelly_size(edge, poly_bid, poly_ask)
         target_size = self.risk.order_size_usdc(kelly_size)
-        if target_size <= 0:
-            await self.engine.cancel_all_for(market.condition_id)
-            # Still record the snapshot so the dashboard can see what happened
-            zero_decision = self.engine.build_decision(
-                fair_mid=fair_mid, poly_best_bid=poly_bid, poly_best_ask=poly_ask,
-                target_size_usdc=0.0, tick=market.tick_size,
+
+        # 2g. Late-window phases — narrow the action space as we approach
+        # resolution. We never place NEW orders inside HOLD; existing orders
+        # ride out as the model still cancels-and-replaces on drift.
+        in_hold_phase = t_remaining <= LATE_WINDOW_HOLD_S
+        in_tighten_phase = t_remaining <= LATE_WINDOW_TIGHTEN_S
+
+        if target_size <= 0 or in_hold_phase:
+            # Don't place new — but DO let the engine cancel anything stale.
+            zero_decision = QuoteDecision(
+                side="NONE", fair_mid=fair_mid,
+                edge_bid=fair_mid - poly_bid, edge_ask=poly_ask - fair_mid,
+                poly_best_bid=poly_bid, poly_best_ask=poly_ask,
+                target_size_usdc=0.0,
             )
-            self._maybe_log_snapshot(market, feed_state, sigma, out, poly_bid, poly_ask, zero_decision, now)
+            await self.engine.reconcile(market, zero_decision, now)
+            self._maybe_log_snapshot(
+                market, feed_state, sigma, out, poly_bid, poly_ask, zero_decision, now,
+                phase="HOLD" if in_hold_phase else "NO_SIZE",
+            )
             return
 
-        decision = self.engine.build_decision(
-            fair_mid=fair_mid,
-            poly_best_bid=poly_bid,
-            poly_best_ask=poly_ask,
-            target_size_usdc=target_size,
-            tick=market.tick_size,
-        )
+        # Inventory: positive USDC = net long YES, negative = net short.
+        inventory_usdc = self.risk.state.inventory_by_market.get(market.condition_id, 0.0)
+
+        if self.use_two_sided:
+            decision = self.engine.build_decision_two_sided(
+                fair_mid=fair_mid,
+                poly_best_bid=poly_bid,
+                poly_best_ask=poly_ask,
+                target_size_usdc=target_size,
+                tick=market.tick_size,
+                sigma_per_sqrt_s=sigma,
+                t_remaining_s=t_remaining,
+                inventory_usdc=inventory_usdc,
+                per_market_max_inventory_usdc=self.risk.per_market_max_inventory_usdc,
+            )
+        else:
+            decision = self.engine.build_decision(
+                fair_mid=fair_mid,
+                poly_best_bid=poly_bid,
+                poly_best_ask=poly_ask,
+                target_size_usdc=target_size,
+                tick=market.tick_size,
+            )
+
+        # In tighten phase: shrink size to half so we don't get caught with
+        # large quotes during the high-toxicity final minute.
+        if in_tighten_phase and decision.side != "NONE":
+            decision.target_size_usdc = decision.target_size_usdc * 0.5
+            if decision.bid_size_usdc is not None:
+                decision.bid_size_usdc = decision.bid_size_usdc * 0.5
+            if decision.ask_size_usdc is not None:
+                decision.ask_size_usdc = decision.ask_size_usdc * 0.5
+
         await self.engine.reconcile(market, decision, now)
 
-        # 2f. Snapshot for forensics
-        self._maybe_log_snapshot(market, feed_state, sigma, out, poly_bid, poly_ask, decision, now)
+        # 2h. Snapshot for forensics
+        self._maybe_log_snapshot(
+            market, feed_state, sigma, out, poly_bid, poly_ask, decision, now,
+            phase="TIGHTEN" if in_tighten_phase else "NORMAL",
+        )
 
     async def _process_fills_and_resolutions(self, now: float) -> None:
         # Fills
@@ -320,17 +389,119 @@ class CryptoLagCycle:
         return out
 
     def _resolve_yes_value(self, market: PolyCryptoMarket, now: float) -> float:
-        """At resolution: YES wins if Binance close > strike at endDate.
+        """At resolution: YES wins if Binance close >= strike at endDate.
 
-        We use the most recent Binance mid as a proxy for the close price (the
+        Polymarket convention: end ≥ start counts as UP (YES wins ties). We
+        use the most recent Binance mid as a proxy for the close price (the
         cycle ticks every few seconds, so we'll sample within seconds of the
         actual close). For a more robust LIVE implementation, snap the close
-        from Binance's REST `/klines` endpoint at endDate.
+        from Binance's REST `/klines` endpoint at endDate, or — better —
+        from Chainlink Data Streams which is the actual oracle Polymarket
+        uses (see plan F0.3).
         """
         st = self.feed.get_state(market.symbol)
         if st is None or st.mid <= 0 or market.strike_price <= 0:
             return 0.5  # unknown — settle at midpoint (conservative)
-        return 1.0 if st.mid > market.strike_price else 0.0
+        # Tie convention matches Polymarket "Up or Down": end ≥ start = UP
+        return 1.0 if st.mid >= market.strike_price else 0.0
+
+    def _compose_sigma(self, symbol: str, feed_state, now: float) -> float:
+        """Compose the rolling realized vol (EWMA), the bootstrapped historical
+        klines vol, the Deribit IV (if available) and the GARCH(1,1) one-step
+        forecast into a single σ-per-√second.
+
+        For the *realized* leg we mirror the original n_rt blend so we don't
+        over-weight a near-empty rolling history; for the *IV* and *GARCH*
+        legs we just feed them in if present and let `blend_volatility`
+        redistribute weights when one is missing.
+        """
+        rt_history = list(feed_state.price_history)
+        rt_sigma = realized_vol_per_sqrt_s(
+            rt_history,
+            mode=self.realized_mode,
+            ewma_lambda=self.ewma_lambda,
+        )
+        hist_sigma = self.feed.get_hist_sigma(symbol)
+        n_rt = len(rt_history)
+        if n_rt < 60:
+            realized_leg = hist_sigma
+        elif n_rt < 300:
+            alpha = (n_rt - 60) / (300 - 60)
+            realized_leg = (1.0 - alpha) * hist_sigma + alpha * rt_sigma
+        else:
+            realized_leg = rt_sigma
+        realized_leg = max(realized_leg, 1e-5)
+
+        # Deribit IV (annualized → per-√second already done in the provider).
+        iv_leg: Optional[float] = None
+        if self.deribit_iv is not None:
+            try:
+                iv_val = self.deribit_iv.get_sigma_per_sqrt_s(symbol)
+                if iv_val is not None and iv_val > 0:
+                    iv_leg = float(iv_val)
+            except Exception:
+                iv_leg = None
+
+        # GARCH(1,1): the model is fit on per-bar (1m) returns, so its sigma
+        # is per √minute. We convert to per-√second here.
+        garch_leg: Optional[float] = None
+        g = self._garch.get(symbol)
+        if g is not None and g.fitted:
+            try:
+                sigma_per_sqrt_minute = g.sigma()
+                if sigma_per_sqrt_minute > 0:
+                    # 1 minute = 60 seconds → divide by √60 to go per-√second
+                    garch_leg = float(sigma_per_sqrt_minute / math.sqrt(60.0))
+            except Exception:
+                garch_leg = None
+
+        sigma = blend_volatility(
+            realized=realized_leg,
+            iv=iv_leg,
+            garch=garch_leg,
+            weights=self.vol_weights,
+        )
+        return max(sigma, 1e-5)
+
+    def _refit_garch_if_due(self, symbol: str, now: float) -> None:
+        """Initialize / refit the per-symbol GARCH(1,1) once per hour using
+        the last 24h of rolling 1m bars from the feed's price_history.
+
+        We avoid pulling fresh REST klines just for GARCH (the bootstrap
+        already does that for σ-historical). Instead we use whichever bars
+        we currently hold; on a freshly-started bot the rolling history is
+        short and GARCH will quickly converge to long-run sigma.
+        """
+        if symbol not in self.feed.symbols:
+            return
+        hour = int(now // 3600)
+        last_hour = self._garch_last_refit_hour.get(symbol, -1)
+        if hour == last_hour and symbol in self._garch:
+            return
+        st = self.feed.get_state(symbol)
+        if st is None or len(st.price_history) < 30:
+            return
+        # Build per-minute bars from the rolling tick history (we resample
+        # each minute's last price). With the deque maxlen of 600 ticks and
+        # frequent updates, this typically covers ~5min of high-freq data —
+        # not enough for a great GARCH fit, but stable enough as a seed.
+        prices = [p for _ts, p in st.price_history if p > 0]
+        if len(prices) < 5:
+            return
+        rets = returns_from_prices(prices)
+        if len(rets) < 5:
+            return
+        try:
+            g = self._garch.get(symbol) or Garch11()
+            g.fit(rets)
+            self._garch[symbol] = g
+            self._garch_last_refit_hour[symbol] = hour
+            logger.info(
+                f"GARCH({symbol}): refit on {len(rets)} returns → "
+                f"σ_next={g.sigma():.2e}/√bar (lr={g.long_run_sigma():.2e})"
+            )
+        except Exception as exc:
+            logger.debug(f"GARCH({symbol}) refit failed: {exc}")
 
     # Rate limit heartbeat snapshots to one every 30s per condition_id so we
     # don't fill the DB with thousands of "GATED" rows when many markets are
@@ -395,7 +566,8 @@ class CryptoLagCycle:
             logger.debug(f"heartbeat snapshot error: {exc}")
 
     def _maybe_log_snapshot(
-        self, market, feed_state, sigma, out, poly_bid, poly_ask, decision, now
+        self, market, feed_state, sigma, out, poly_bid, poly_ask, decision, now,
+        phase: str = "NORMAL",
     ) -> None:
         # Snapshot logging: keep light unless explicitly enabled.
         if self.db is None:
@@ -430,3 +602,17 @@ class CryptoLagCycle:
             self.db.log_crypto_lag_close(ev)
         except Exception:
             pass
+
+
+def _book_imbalance(bid_size: float, ask_size: float) -> float:
+    """Top-of-book imbalance ∈ [-1, 1]. Used for Polymarket OBI.
+    Returns 0 when the book is empty / both zero."""
+    try:
+        b = float(bid_size or 0.0)
+        a = float(ask_size or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    denom = b + a
+    if denom <= 0:
+        return 0.0
+    return (b - a) / denom

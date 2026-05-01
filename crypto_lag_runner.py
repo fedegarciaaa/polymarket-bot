@@ -34,6 +34,7 @@ class CryptoLagHandle:
     registry: object          # CryptoMarketRegistry
     executor: object          # PaperExecutor
     engine: object            # MakerOrderEngine
+    deribit_iv: object = None # DeribitIVProvider | None
 
 
 def start_crypto_lag(config: dict, db, logger: logging.Logger,
@@ -53,9 +54,12 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
     from strategies.crypto_lag.binance_feed import BinanceFeed
     from strategies.crypto_lag.poly_markets import CryptoMarketRegistry
     from strategies.crypto_lag.paper_executor import PaperExecutor
-    from strategies.crypto_lag.order_engine import MakerOrderEngine
+    from strategies.crypto_lag.order_engine import (
+        MakerOrderEngine, FEE_RATE_CRYPTO, MAKER_REBATE_SHARE,
+    )
     from strategies.crypto_lag.risk import CryptoLagRisk
     from strategies.crypto_lag.cycle import CryptoLagCycle
+    from strategies.crypto_lag.deribit_iv import DeribitIVProvider
 
     symbols = [s["binance"] for s in cfg.get("symbols", []) if s.get("binance")]
     if not symbols:
@@ -72,15 +76,26 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
         reconnect_initial_seconds=float(binance_cfg.get("reconnect_initial_seconds", 1.0)),
         reconnect_max_seconds=float(binance_cfg.get("reconnect_max_seconds", 30.0)),
     )
+    # Multi-horizon support: prefer_horizons takes precedence over the legacy
+    # single prefer_horizon_minutes when present.
+    prefer_horizons = cfg.get("prefer_horizons")
+    if prefer_horizons is None:
+        prefer_horizons = [int(cfg.get("prefer_horizon_minutes", 5))]
     registry = CryptoMarketRegistry(
         symbols=symbols,
         poll_seconds=float(cfg.get("market_poll_seconds", 30.0)),
-        prefer_horizon_minutes=int(cfg.get("prefer_horizon_minutes", 15)),
+        prefer_horizon_minutes=int(cfg.get("prefer_horizon_minutes", 5)),
+        prefer_horizons=[int(h) for h in prefer_horizons],
+        min_liquidity_usdc=float(cfg.get("min_liquidity_usdc", 0.0)),
+        max_wash_share=float(cfg.get("max_wash_share", 0.10)),
     )
     paper_cfg = cfg.get("paper") or {}
     executor = PaperExecutor(
         q_toxic=float(paper_cfg.get("q_toxic", 0.30)),
         adverse_haircut_pct=float(paper_cfg.get("adverse_haircut_pct", 0.015)),
+        fee_rate=float(cfg.get("fee_rate", FEE_RATE_CRYPTO)),
+        maker_rebate_share=float(cfg.get("maker_rebate_share", MAKER_REBATE_SHARE)),
+        queue_position_enabled=bool(paper_cfg.get("queue_position_enabled", True)),
     )
 
     def _bankroll() -> float:
@@ -98,10 +113,31 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
         edge_threshold_cents=float(cfg.get("edge_threshold_cents", 2.0)),
         replace_threshold_cents=float(cfg.get("replace_threshold_cents", 1.0)),
         max_order_age_seconds=float(cfg.get("max_order_age_seconds", 30.0)),
+        gamma=float(cfg.get("gamma", 0.10)),
+        arrival_intensity_k=float(cfg.get("arrival_intensity_k", 1.5)),
+        inventory_skew_threshold=float(cfg.get("inventory_skew_threshold", 0.7)),
+        fee_rate=float(cfg.get("fee_rate", FEE_RATE_CRYPTO)),
+        maker_rebate_share=float(cfg.get("maker_rebate_share", MAKER_REBATE_SHARE)),
     )
+
+    # Deribit IV provider (optional). Disable cleanly if aiohttp is missing
+    # or the user opts out via config.
+    deribit_cfg = cfg.get("deribit") or {}
+    deribit_iv = None
+    if bool(deribit_cfg.get("enabled", True)):
+        try:
+            deribit_iv = DeribitIVProvider(
+                symbols=symbols,
+                refresh_seconds=float(deribit_cfg.get("refresh_seconds", 300.0)),
+            )
+        except Exception as exc:
+            logger.warning(f"crypto_lag: DeribitIVProvider init failed: {exc}")
+            deribit_iv = None
+
     cycle = CryptoLagCycle(
         config=config, feed=feed, registry=registry, executor=executor,
         engine=engine, risk=risk, db=db, notifier=notifier,
+        deribit_iv=deribit_iv,
     )
 
     loop = asyncio.new_event_loop()
@@ -113,6 +149,11 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
         await feed.start()
         await registry.start()
         await executor.start()
+        if deribit_iv is not None:
+            try:
+                await deribit_iv.start()
+            except Exception as exc:
+                logger.warning(f"crypto_lag: deribit_iv.start failed: {exc}")
         try:
             await cycle.run_forever()
         finally:
@@ -121,6 +162,11 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             await registry.stop()
             await feed.stop()
             await executor.stop()
+            if deribit_iv is not None:
+                try:
+                    await deribit_iv.stop()
+                except Exception:
+                    pass
 
     def _thread_main():
         if sys.platform == "win32":
@@ -150,6 +196,7 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
     return CryptoLagHandle(
         thread=th, loop=loop, cycle=cycle, feed=feed,
         registry=registry, executor=executor, engine=engine,
+        deribit_iv=deribit_iv,
     )
 
 
