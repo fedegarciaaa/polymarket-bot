@@ -68,6 +68,40 @@ except ImportError as e:
 from .order_engine import FEE_RATE_CRYPTO, MAKER_REBATE_SHARE, expected_maker_rebate
 from .state import RestingOrder, Position
 
+
+def _best_level(levels, want_max: bool):
+    """Pick the best (price, size) from a Polymarket book ladder.
+
+    Polymarket returns bids and asks as lists of {"price": str, "size": str},
+    where bids are sorted ASCENDING (worst → best) and asks DESCENDING
+    (worst → best). To be defensive against any future ordering change
+    (and to handle empty / malformed entries), we scan the entire ladder
+    and pick the max-price level on the bid side, min-price on the ask
+    side. Returns (price, size) as floats, or None if no valid level.
+    """
+    if not levels:
+        return None
+    best_p: float = None  # type: ignore[assignment]
+    best_s: float = 0.0
+    for lvl in levels:
+        try:
+            p = float(lvl["price"])
+            s = float(lvl.get("size", 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if s <= 0:
+            continue
+        if best_p is None:
+            best_p, best_s = p, s
+            continue
+        if want_max and p > best_p:
+            best_p, best_s = p, s
+        elif (not want_max) and p < best_p:
+            best_p, best_s = p, s
+    if best_p is None:
+        return None
+    return (best_p, best_s)
+
 logger = logging.getLogger("polymarket_bot.crypto_lag.paper")
 
 
@@ -312,14 +346,20 @@ class PaperExecutor:
                 data = await r.json()
             bids = data.get("bids") or []
             asks = data.get("asks") or []
+            # CRITICAL: Polymarket CLOB returns bids in ASCENDING price order
+            # (bids[0] is the WORST bid, e.g. 0.01) and asks in DESCENDING
+            # order (asks[0] is the WORST ask, e.g. 0.99). Best bid is the
+            # MAX bid price; best ask is the MIN ask price. Using bids[0]
+            # / asks[0] like the v1 code did was a critical bug that made
+            # every market look like spread=0.98 → NO_BOOK.
+            best_bid_lvl = _best_level(bids, want_max=True)
+            best_ask_lvl = _best_level(asks, want_max=False)
             book = {
-                "best_bid": float(bids[0]["price"]) if bids else None,
-                "best_ask": float(asks[0]["price"]) if asks else None,
-                "bid_size": float(bids[0].get("size", 0.0)) if bids else 0.0,
-                "ask_size": float(asks[0].get("size", 0.0)) if asks else 0.0,
-                # Keep the full ladder for queue-position simulation. We only
-                # need the top-of-book to determine if our level still exists
-                # and what its visible size is.
+                "best_bid": best_bid_lvl[0] if best_bid_lvl is not None else None,
+                "best_ask": best_ask_lvl[0] if best_ask_lvl is not None else None,
+                "bid_size": best_bid_lvl[1] if best_bid_lvl is not None else 0.0,
+                "ask_size": best_ask_lvl[1] if best_ask_lvl is not None else 0.0,
+                # Keep the full ladder for queue-position simulation.
                 "_raw_bids": bids,
                 "_raw_asks": asks,
             }
