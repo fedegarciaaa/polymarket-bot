@@ -25,10 +25,47 @@ to σ-per-√second we divide by 100 (to fraction) and by √(seconds_per_year).
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import math
+import re
 import time
 from typing import Optional
+
+
+# Deribit instrument names follow `<CURR>-<DDMMMYY>-<STRIKE>-<C|P>`. Months
+# come as 3-letter codes; we map them once for performance.
+_DERIBIT_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+_DATE_RE = re.compile(r"^(\d{1,2})([A-Z]{3})(\d{2})$")
+
+
+def _parse_deribit_expiry_ms(instrument_name: str) -> Optional[float]:
+    """Extract expiry timestamp (ms) from a Deribit option name.
+
+    Deribit options expire at 08:00 UTC on the expiry date — we use that
+    convention here so the filter window is comparable across currencies.
+    Returns None on any parse failure (the caller treats that as "skip").
+    """
+    parts = (instrument_name or "").split("-")
+    if len(parts) != 4:
+        return None
+    m = _DATE_RE.match(parts[1])
+    if m is None:
+        return None
+    day = int(m.group(1))
+    month = _DERIBIT_MONTHS.get(m.group(2))
+    if month is None:
+        return None
+    year_two = int(m.group(3))
+    year = 2000 + year_two if year_two < 70 else 1900 + year_two
+    try:
+        # Deribit settles at 08:00 UTC on expiry day.
+        return float(calendar.timegm((year, month, day, 8, 0, 0, 0, 0, 0)) * 1000)
+    except (ValueError, OverflowError):
+        return None
 
 try:
     import aiohttp
@@ -260,10 +297,14 @@ class DeribitIVProvider:
                 mark_iv = float(opt.get("mark_iv") or 0.0)
                 if mark_iv <= 0:
                     continue
-                # We don't need to parse the expiry ourselves; Deribit gives us
-                # `creation_timestamp` and stores expiry in the chain payload.
-                expiry_ms = float(opt.get("expiration_timestamp") or 0.0)
-                if expiry_ms <= 0:
+                # Deribit's book_summary endpoint returns `expiration_timestamp`
+                # as `null` for option instruments (only the dedicated
+                # /get_instruments endpoint populates it), so we parse the
+                # date out of the instrument_name (`BTC-6MAY26-78000-C`)
+                # ourselves. Returns None if the format is unexpected, in
+                # which case we skip the option entirely.
+                expiry_ms = _parse_deribit_expiry_ms(name)
+                if expiry_ms is None or expiry_ms <= 0:
                     continue
                 if expiry_ms - now_ms > max_ms_ahead:
                     continue
