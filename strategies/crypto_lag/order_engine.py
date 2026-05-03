@@ -418,6 +418,12 @@ class MakerOrderEngine:
             size_usdc=size_usdc,
             placed_ts=now,
             last_replace_ts=now,
+            # Snapshot market metadata so the cycle can resolve this position
+            # even after the market drops off Gamma's active list.
+            end_ts=float(market.end_ts),
+            strike_price=float(market.strike_price),
+            market_slug=str(market.market_slug),
+            tick_size=float(market.tick_size),
         )
         try:
             ext = await self.executor.place_order(order, market.token_yes)

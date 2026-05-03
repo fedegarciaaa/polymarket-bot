@@ -119,6 +119,9 @@ class _FillEvent:
     rebate_usdc: float = 0.0   # maker rebate credited by this fill (≥ 0)
     fee_paid_usdc: float = 0.0 # 0 for makers, > 0 only if executor models taker
                                 # crossings (currently we never cross)
+    # Market metadata copied from the RestingOrder so downstream loggers
+    # (database.log_crypto_lag_fill) can persist `market_slug` instead of NULL.
+    market_slug: str = ""
 
 
 @dataclass
@@ -243,7 +246,7 @@ class PaperExecutor:
                 if ev is not None:
                     fills.append(ev)
                     self._fill_log.append(ev)
-                    self._apply_fill_to_position(ev)
+                    self._apply_fill_to_position(ev, order)
                     if order.filled_size_usdc >= order.size_usdc - 1e-6:
                         order.status = "filled"
                         self._resting.pop(order.order_id, None)
@@ -517,9 +520,12 @@ class PaperExecutor:
             ts=time.time(),
             rebate_usdc=float(rebate),
             fee_paid_usdc=0.0,
+            market_slug=order.market_slug,
         )
 
-    def _apply_fill_to_position(self, ev: _FillEvent) -> None:
+    def _apply_fill_to_position(
+        self, ev: _FillEvent, order: Optional[RestingOrder] = None
+    ) -> None:
         pos = self._positions.get(ev.condition_id)
         # Map (side, outcome) → signed direction for our YES-centric position
         # We track position.outcome as the side the bot is long on.
@@ -532,6 +538,11 @@ class PaperExecutor:
                 avg_entry_price=ev.fill_price,
                 opened_ts=ev.ts,
                 last_fill_ts=ev.ts,
+                # Snapshot market metadata from the RestingOrder so resolution
+                # works even after Polymarket drops the market off Gamma.
+                end_ts=float(order.end_ts) if order is not None else 0.0,
+                strike_price=float(order.strike_price) if order is not None else 0.0,
+                market_slug=str(order.market_slug) if order is not None else "",
             )
             return
         # Two-sided MM: BUYs add long YES, SELLs add short YES. We track the

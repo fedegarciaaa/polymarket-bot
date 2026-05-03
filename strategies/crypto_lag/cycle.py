@@ -195,6 +195,10 @@ class CryptoLagCycle:
             logger.info(
                 f"strike captured {market.symbol} {market.market_slug[:30]}: {feed_state.mid:.2f}"
             )
+            # Cancel any previously-placed orders on this cid so the
+            # `risk.open_orders_count` doesn't leak while we wait for the next
+            # tick to (re)quote with the freshly-captured strike.
+            await self.engine.cancel_all_for(market.condition_id)
             self._heartbeat_snapshot(market, feed_state, now, decision="STRIKE_CAPTURED")
             return  # next tick will quote with strike known
 
@@ -215,15 +219,19 @@ class CryptoLagCycle:
         # 2d. Pull Polymarket book from the executor's cache (it polls on its own)
         book = await self.executor._get_book(market.token_yes)  # noqa: SLF001
         if not book or book.get("best_bid") is None or book.get("best_ask") is None:
+            # Cancel any orders that might be resting on this cid so the
+            # max_concurrent_orders counter doesn't leak when the book vanishes.
+            await self.engine.cancel_all_for(market.condition_id)
             self._heartbeat_snapshot(market, feed_state, now, decision="NO_BOOK", sigma=sigma)
             return
         poly_bid = float(book["best_bid"])
         poly_ask = float(book["best_ask"])
         poly_mid = 0.5 * (poly_bid + poly_ask)
 
-        # Gate: skip markets with no real liquidity (spread > 80 cents means
-        # essentially empty book — quoting at 0.02/0.98 will never fill).
+        # Gate: skip markets with no real liquidity (a wide spread means the
+        # book is essentially empty — quoting at 0.02/0.98 will never fill).
         if poly_ask - poly_bid > self.max_book_spread:
+            await self.engine.cancel_all_for(market.condition_id)
             self._heartbeat_snapshot(market, feed_state, now, decision="NO_BOOK", sigma=sigma)
             return
 
@@ -342,19 +350,40 @@ class CryptoLagCycle:
                 except Exception as exc:
                     logger.debug(f"notify_crypto_lag_fill failed: {exc}")
 
-        # Resolutions: any market whose endDate passed → settle
+        # Resolutions: any market whose endDate passed → settle.
+        # We iterate `executor._positions` and use the end_ts/strike/symbol
+        # snapshotted on the Position itself (set when the position was first
+        # opened). This is the ONLY reliable source: Polymarket drops markets
+        # off the Gamma `active` list within seconds of endDate, so a
+        # registry-based lookup would silently miss every resolution.
         for cid, pos in list(self.executor._positions.items()):  # noqa: SLF001
-            mkt = next(
-                (m for m in self._all_known_markets() if m.condition_id == cid),
-                None,
-            )
-            if mkt is None:
-                # market dropped off registry (already past end). Use stored end_ts
-                # via a per-symbol Binance close. Fall through.
+            # Prefer the snapshot stored on the Position; fall back to the
+            # registry only for legacy positions opened before this code
+            # landed (no end_ts set).
+            end_ts = float(getattr(pos, "end_ts", 0.0) or 0.0)
+            strike = float(getattr(pos, "strike_price", 0.0) or 0.0)
+            symbol = pos.symbol
+            slug = str(getattr(pos, "market_slug", "") or "")
+            if end_ts <= 0.0 or strike <= 0.0:
+                mkt = next(
+                    (m for m in self._all_known_markets() if m.condition_id == cid),
+                    None,
+                )
+                if mkt is None:
+                    continue
+                end_ts = mkt.end_ts
+                strike = mkt.strike_price
+                symbol = mkt.symbol
+                slug = mkt.market_slug
+            if end_ts > now:
                 continue
-            if mkt.end_ts > now:
-                continue
-            yes_value = self._resolve_yes_value(mkt, now)
+            # YES wins on tie (Polymarket "Up or Down" convention). Settle off
+            # the most recent Binance mid we have for this symbol.
+            st = self.feed.get_state(symbol)
+            if st is None or st.mid <= 0 or strike <= 0:
+                yes_value = 0.5  # unknown — settle at midpoint (conservative)
+            else:
+                yes_value = 1.0 if st.mid >= strike else 0.0
             ev = await self.executor.resolve_market(cid, yes_value, ts=now)
             if ev is not None:
                 self.risk.on_close(ev.realized_pnl_usdc)
@@ -369,7 +398,7 @@ class CryptoLagCycle:
                             realized_pnl_usdc=ev.realized_pnl_usdc,
                             final_yes_price=ev.final_yes_price,
                             reason=ev.reason,
-                            market_slug=mkt.market_slug if mkt else "",
+                            market_slug=slug,
                         )
                     except Exception as exc:
                         logger.debug(f"notify_crypto_lag_close failed: {exc}")
@@ -378,6 +407,24 @@ class CryptoLagCycle:
         for ev in self.executor.drain_close_log():
             # already handled above for ones we triggered; this is a safety drain
             pass
+
+        # Counter leak defense: cancel orders for any cid whose market has
+        # ended (or is gone from the registry). _handle_market only runs for
+        # markets active_for() returns, so dead-cid orders would otherwise
+        # accumulate forever in engine._open and drive `open_orders_count`
+        # above max_concurrent_orders, gating the bot globally. See
+        # https://github.com/.../bot-prod-1 30h diagnostic for context.
+        live_cids: set[str] = set()
+        for sym in self.feed.symbols:
+            for m in self.registry.active_for(sym, now):
+                live_cids.add(m.condition_id)
+        for cid in list(self.engine._open.keys()):  # noqa: SLF001
+            if cid in live_cids:
+                continue
+            try:
+                await self.engine.cancel_all_for(cid)
+            except Exception as exc:
+                logger.debug(f"orphan cancel {cid[:12]}...: {exc}")
 
     # ─── small helpers ──────────────────────────────────────────
     def _kelly_size(self, edge: float, bid: float, ask: float) -> float:
@@ -477,12 +524,21 @@ class CryptoLagCycle:
 
     def _refit_garch_if_due(self, symbol: str, now: float) -> None:
         """Initialize / refit the per-symbol GARCH(1,1) once per hour using
-        the last 24h of rolling 1m bars from the feed's price_history.
+        proper 1-minute bars resampled from the feed's tick history.
 
-        We avoid pulling fresh REST klines just for GARCH (the bootstrap
-        already does that for σ-historical). Instead we use whichever bars
-        we currently hold; on a freshly-started bot the rolling history is
-        short and GARCH will quickly converge to long-run sigma.
+        BUG FIX (May 2026): the previous implementation fed RAW ticks (sub-1s
+        spaced) directly to `returns_from_prices`. Tick-to-tick log-returns on
+        a $50k BTC barely moving $1/sec are O(1e-5), squared O(1e-10), which
+        never moves the conditional variance off the GARCH long-run baseline
+        ω/(1-β) ≈ 6.67e-7 → σ ≈ 8.16e-4. As a result every symbol converged
+        to the *same* long-run σ regardless of the actual price action,
+        breaking the IV-vs-realized-vs-GARCH blend for BNB/XRP/DOGE.
+
+        Resampling to 1-minute bars (last price per minute bucket) recovers
+        the volatility scale the GARCH was designed for. With deque maxlen
+        of 600 ticks at ~1 tick/sec this typically yields 5-10 bars — short
+        but enough to differentiate symbols; the recursion adapts as more
+        data accumulates and the hourly refit refreshes the seed.
         """
         if symbol not in self.feed.symbols:
             return
@@ -493,15 +549,24 @@ class CryptoLagCycle:
         st = self.feed.get_state(symbol)
         if st is None or len(st.price_history) < 30:
             return
-        # Build per-minute bars from the rolling tick history (we resample
-        # each minute's last price). With the deque maxlen of 600 ticks and
-        # frequent updates, this typically covers ~5min of high-freq data —
-        # not enough for a great GARCH fit, but stable enough as a seed.
-        prices = [p for _ts, p in st.price_history if p > 0]
-        if len(prices) < 5:
+        # Resample tick history to 1-minute bars: keep the LAST price seen in
+        # each integer-minute bucket (UTC). Iterating the deque is ordered;
+        # we trust the per-tick `ts` is monotonically non-decreasing.
+        last_per_minute: dict[int, float] = {}
+        for ts, p in st.price_history:
+            try:
+                if p is None or float(p) <= 0:
+                    continue
+                bucket = int(float(ts) // 60)
+                last_per_minute[bucket] = float(p)
+            except (TypeError, ValueError):
+                continue
+        # Sort by minute bucket so returns are computed in chronological order.
+        bars = [last_per_minute[k] for k in sorted(last_per_minute.keys())]
+        if len(bars) < 3:
             return
-        rets = returns_from_prices(prices)
-        if len(rets) < 5:
+        rets = returns_from_prices(bars)
+        if len(rets) < 2:
             return
         try:
             g = self._garch.get(symbol) or Garch11()
@@ -509,7 +574,7 @@ class CryptoLagCycle:
             self._garch[symbol] = g
             self._garch_last_refit_hour[symbol] = hour
             logger.info(
-                f"GARCH({symbol}): refit on {len(rets)} returns → "
+                f"GARCH({symbol}): refit on {len(rets)} 1m returns → "
                 f"σ_next={g.sigma():.2e}/√bar (lr={g.long_run_sigma():.2e})"
             )
         except Exception as exc:

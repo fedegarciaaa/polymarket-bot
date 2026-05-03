@@ -365,13 +365,18 @@ class Database:
 
     def log_crypto_lag_fill(self, fill, variant: str = "main") -> None:
         c = self.conn.cursor()
+        # `market_slug` is best-effort (zero on _FillEvent objects produced by
+        # older code that didn't set it) so we use getattr with a "" default
+        # to keep this call idempotent across deployments.
         c.execute(
             """INSERT INTO crypto_lag_quotes
-               (ts, symbol, condition_id, side, outcome, price, size_usdc,
-                status, fill_price, fill_size_usdc, is_adverse, local_order_id, variant)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (ts, symbol, condition_id, market_slug, side, outcome, price,
+                size_usdc, status, fill_price, fill_size_usdc, is_adverse,
+                local_order_id, variant)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 float(fill.ts), fill.symbol, fill.condition_id,
+                str(getattr(fill, "market_slug", "") or ""),
                 fill.side, fill.outcome, float(fill.fill_price),
                 float(fill.fill_size_usdc), "filled",
                 float(fill.fill_price), float(fill.fill_size_usdc),

@@ -262,7 +262,14 @@ crypto_lag:
   per_market_max_inventory_usdc: 100
   max_concurrent_orders: 12      # con two-sided podemos abrir 2 por market
   kelly_fraction: 0.10
-  flatten_before_resolution_seconds: 10  # F1.5: cancel all en últimos 10s
+  flatten_before_resolution_seconds: 30  # cancel all en últimos 30s — los
+                                         # 10 anteriores dejaban exposición
+                                         # tóxica en el último ~30s decisivo
+  # Spread máximo del book de Polymarket más allá del cual consideramos que
+  # el book está vacío y no merece la pena cotizar. El default histórico era
+  # 0.80 — efectivamente sin filtro, ya que en horario de mercado los spreads
+  # observados son $0.001-$0.020. Bajado a 0.10 tras el diagnóstico 2-May.
+  max_book_spread: 0.10
   imbalance_alpha: 0.03          # peso de book imbalance Binance en el modelo
   poly_obi_alpha: 0.02           # peso de OBI Polymarket (own-book)
   poly_blend_weight: 0.10        # peso del mid de Polymarket en el blend final

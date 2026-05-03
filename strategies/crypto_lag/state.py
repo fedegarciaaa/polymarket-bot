@@ -90,6 +90,13 @@ class RestingOrder:
     last_replace_ts: float
     filled_size_usdc: float = 0.0
     status: str = "open"           # open | partially_filled | filled | canceled
+    # Market metadata copied from the PolyCryptoMarket at placement time so we
+    # can resolve the position even if the market drops off the registry
+    # between fill and resolution. Set by MakerOrderEngine._upsert.
+    end_ts: float = 0.0
+    strike_price: float = 0.0
+    market_slug: str = ""
+    tick_size: float = 0.01
 
 
 @dataclass
@@ -104,6 +111,12 @@ class Position:
     last_fill_ts: float
     realized_pnl_usdc: float = 0.0
     unrealized_pnl_usdc: float = 0.0
+    # Snapshot of market metadata so resolution does NOT depend on the registry
+    # still listing the market (Polymarket drops markets seconds after endDate;
+    # the position keeps these as the source of truth for end_ts / strike).
+    end_ts: float = 0.0
+    strike_price: float = 0.0
+    market_slug: str = ""
 
 
 # ─────────────────────────────────────────────────────────────────

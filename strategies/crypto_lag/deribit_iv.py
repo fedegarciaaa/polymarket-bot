@@ -96,8 +96,24 @@ class DeribitIVProvider:
             return
         if self._task is not None:
             return
+        # Surface arrival in production logs so we can tell the difference
+        # between "provider never started" and "provider started but every
+        # fetch failed". Both used to look identical (silent).
+        logger.info(
+            f"deribit_iv: starting ({len(self.symbols)} symbols, "
+            f"refresh={self.refresh_seconds:.0f}s)"
+        )
         # Prime the cache once before background polling kicks in
         await self._refresh_all()
+        primed = sorted(self._cache.keys())
+        if primed:
+            logger.info(f"deribit_iv: primed cache for {','.join(primed)}")
+        else:
+            logger.warning(
+                "deribit_iv: initial refresh produced 0 IV values "
+                f"({len(self.symbols)} symbols); will keep retrying every "
+                f"{self.refresh_seconds:.0f}s"
+            )
         self._task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
@@ -154,14 +170,18 @@ class DeribitIVProvider:
             needed.setdefault(curr, []).append(sym)
         if not needed:
             return
+        successes = 0
+        failures: list[str] = []
         async with aiohttp.ClientSession() as session:
             for curr, syms in needed.items():
                 try:
                     iv_annualized = await self._fetch_atm_mark_iv(session, curr)
                 except Exception as exc:
+                    failures.append(f"{curr}({type(exc).__name__})")
                     logger.debug(f"deribit IV fetch {curr}: {exc}")
                     continue
                 if iv_annualized is None or iv_annualized <= 0:
+                    failures.append(f"{curr}(no-atm)")
                     continue
                 # Annualized fraction → per-√second
                 sigma_per_sqrt_s = (iv_annualized / 100.0) / math.sqrt(_SECONDS_PER_YEAR)
@@ -172,10 +192,17 @@ class DeribitIVProvider:
                         continue
                     _curr, scale = mapped
                     self._cache[sym] = (sigma_per_sqrt_s * scale, now)
+                successes += 1
                 logger.info(
                     f"deribit IV {curr}: mark_iv={iv_annualized:.1f}% ann → "
                     f"σ={sigma_per_sqrt_s:.2e}/√s for {','.join(syms)}"
                 )
+        # If every currency failed, surface a single warning so operators see
+        # something in `journalctl | grep deribit` instead of total silence.
+        if successes == 0 and failures:
+            logger.warning(
+                f"deribit_iv: refresh failed for ALL currencies ({','.join(failures)})"
+            )
 
     async def _fetch_atm_mark_iv(
         self, session: "aiohttp.ClientSession", currency: str
