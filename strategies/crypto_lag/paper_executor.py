@@ -65,7 +65,10 @@ try:
 except ImportError as e:
     raise ImportError("crypto_lag.paper_executor requires aiohttp") from e
 
-from .order_engine import FEE_RATE_CRYPTO, MAKER_REBATE_SHARE, expected_maker_rebate
+from .order_engine import (
+    FEE_RATE_CRYPTO, MAKER_REBATE_SHARE,
+    expected_maker_rebate, parabolic_fee,
+)
 from .state import RestingOrder, Position
 
 
@@ -319,6 +322,13 @@ class PaperExecutor:
         self._close_log.append(ev)
         return ev
 
+    def get_queue_debt(self, order_id: str) -> float:
+        """Diagnostics accessor — returns the current modeled queue debt
+        (USDC of volume ahead of us at our level) for a resting order. Used
+        by the engine's placement_logger to persist alongside the order in
+        crypto_lag_quotes for fill-rate analysis."""
+        return float(self._queue_debt.get(order_id, 0.0))
+
     def get_position(self, condition_id: str) -> Optional[Position]:
         return self._positions.get(condition_id)
 
@@ -495,19 +505,33 @@ class PaperExecutor:
                 fill_price = max(fill_price, 0.01)
 
         order.filled_size_usdc += fill_size
-        # Maker rebate: paid on fill_price, on the notional that was filled.
-        # In real Polymarket the rebate accrues daily — we book it immediately
-        # so DEMO PnL matches LIVE economics from the first fill.
-        rebate = (
-            expected_maker_rebate(
-                fill_price,
-                fee_rate=self.fee_rate,
-                rebate_share=self.maker_rebate_share,
+        # Fee accounting splits on whether this order crossed the book at
+        # placement (is_taker) or rested:
+        #   * Maker fill → 0 fee paid, expected rebate credited.
+        #   * Taker fill → fee paid (parabolic fee on filled notional), no
+        #                  rebate. The rebate share that the COUNTERPARTY (a
+        #                  resting maker) receives is THEIR side, not ours.
+        if order.is_taker:
+            fee_paid = (
+                parabolic_fee(fill_price, fee_rate=self.fee_rate) * fill_size
             )
-            * fill_size
-        )
-        prev_rebate = self._rebate_acc.get(order.condition_id, 0.0)
-        self._rebate_acc[order.condition_id] = prev_rebate + float(rebate)
+            rebate = 0.0
+            prev_fee = self._rebate_acc.get(order.condition_id, 0.0)
+            # Reuse _rebate_acc as a signed accumulator (rebates += positive,
+            # fees += negative). resolve_market sums it directly into PnL.
+            self._rebate_acc[order.condition_id] = prev_fee - float(fee_paid)
+        else:
+            rebate = (
+                expected_maker_rebate(
+                    fill_price,
+                    fee_rate=self.fee_rate,
+                    rebate_share=self.maker_rebate_share,
+                )
+                * fill_size
+            )
+            fee_paid = 0.0
+            prev_rebate = self._rebate_acc.get(order.condition_id, 0.0)
+            self._rebate_acc[order.condition_id] = prev_rebate + float(rebate)
         return _FillEvent(
             order_id=order.order_id,
             condition_id=order.condition_id,
@@ -519,7 +543,7 @@ class PaperExecutor:
             is_adverse=is_adverse,
             ts=time.time(),
             rebate_usdc=float(rebate),
-            fee_paid_usdc=0.0,
+            fee_paid_usdc=float(fee_paid),
             market_slug=order.market_slug,
         )
 

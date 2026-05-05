@@ -341,13 +341,24 @@ class Database:
         self.conn.commit()
 
     def _ensure_crypto_lag_variant_column(self) -> None:
-        """Add `variant` column to crypto_lag_* tables on legacy DBs.
+        """Add additive columns to crypto_lag_* tables on legacy DBs.
 
         SQLite ALTER TABLE ADD COLUMN is non-destructive and instantaneous,
         so this is safe to run on every startup. We check existence first so
         the migration is idempotent.
+
+        Schema additions (May 2026 audit follow-up):
+          - `is_taker`         (quotes): 1 when the order crossed the book at
+                                         placement and paid Polymarket's
+                                         taker fee.
+          - `fee_paid_usdc`    (quotes): fee paid on a taker fill (>= 0).
+          - `rebate_usdc`      (quotes): rebate credited on a maker fill.
+          - `queue_debt_usdc`  (quotes): modeled USDC ahead of us at
+                                         placement time. 0 for taker /
+                                         penny-jumped legs.
         """
         c = self.conn.cursor()
+        # Variant column: required first so the per-variant indexes work.
         for table in ("crypto_lag_quotes", "crypto_lag_state_snapshots", "crypto_lag_closes"):
             try:
                 c.execute(f"PRAGMA table_info({table})")
@@ -361,6 +372,23 @@ class Database:
                     logger.info(f"db migration: added 'variant' column to {table}")
             except sqlite3.OperationalError as exc:
                 logger.warning(f"db migration {table}: {exc}")
+        # Additive crypto_lag_quotes columns (audit follow-up).
+        try:
+            c.execute("PRAGMA table_info(crypto_lag_quotes)")
+            cols = {row["name"] for row in c.fetchall()}
+            for col_name, col_decl in (
+                ("is_taker",         "INTEGER DEFAULT 0"),
+                ("fee_paid_usdc",    "REAL DEFAULT 0"),
+                ("rebate_usdc",      "REAL DEFAULT 0"),
+                ("queue_debt_usdc",  "REAL DEFAULT 0"),
+            ):
+                if col_name not in cols:
+                    c.execute(
+                        f"ALTER TABLE crypto_lag_quotes ADD COLUMN {col_name} {col_decl}"
+                    )
+                    logger.info(f"db migration: added '{col_name}' to crypto_lag_quotes")
+        except sqlite3.OperationalError as exc:
+            logger.warning(f"db migration crypto_lag_quotes additive: {exc}")
         self.conn.commit()
 
     def log_crypto_lag_fill(self, fill, variant: str = "main") -> None:
@@ -372,8 +400,8 @@ class Database:
             """INSERT INTO crypto_lag_quotes
                (ts, symbol, condition_id, market_slug, side, outcome, price,
                 size_usdc, status, fill_price, fill_size_usdc, is_adverse,
-                local_order_id, variant)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                local_order_id, variant, is_taker, fee_paid_usdc, rebate_usdc)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 float(fill.ts), fill.symbol, fill.condition_id,
                 str(getattr(fill, "market_slug", "") or ""),
@@ -381,6 +409,43 @@ class Database:
                 float(fill.fill_size_usdc), "filled",
                 float(fill.fill_price), float(fill.fill_size_usdc),
                 1 if fill.is_adverse else 0, fill.order_id, str(variant),
+                1 if bool(getattr(fill, "fee_paid_usdc", 0.0) > 0) else 0,
+                float(getattr(fill, "fee_paid_usdc", 0.0) or 0.0),
+                float(getattr(fill, "rebate_usdc", 0.0) or 0.0),
+            ),
+        )
+        self.conn.commit()
+
+    def log_crypto_lag_placement(
+        self, order, queue_debt_usdc: float = 0.0, variant: str = "main",
+    ) -> None:
+        """Persist every order acknowledged by the executor (BEFORE any fill).
+
+        Pairs with `log_crypto_lag_fill` to give us the full picture. With
+        `crypto_lag_quotes.status` we can split placed / filled / cancelled
+        rows. Per-variant fill-rate is then a 2-line SQL query instead of
+        regex-grepping the systemd journal."""
+        c = self.conn.cursor()
+        # status: 'placed' for the initial ack. The order's status updates
+        # (cancelled, filled) are reflected in subsequent rows from
+        # log_crypto_lag_fill / explicit cancel logging — we treat each row
+        # as an event, not a stateful update, to keep the table append-only.
+        c.execute(
+            """INSERT INTO crypto_lag_quotes
+               (ts, symbol, condition_id, market_slug, side, outcome, price,
+                size_usdc, status, fill_size_usdc, is_adverse, external_order_id,
+                local_order_id, variant, is_taker, queue_debt_usdc)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                float(order.placed_ts), order.symbol, order.condition_id,
+                str(getattr(order, "market_slug", "") or ""),
+                order.side, order.outcome, float(order.price),
+                float(order.size_usdc), "placed",
+                0.0, 0,
+                str(getattr(order, "external_order_id", "") or ""),
+                str(order.order_id), str(variant),
+                1 if bool(getattr(order, "is_taker", False)) else 0,
+                float(queue_debt_usdc or 0.0),
             ),
         )
         self.conn.commit()
@@ -995,13 +1060,20 @@ class Database:
     # ------------------------------------------------------------------
     def wipe_runtime_tables(self, reset_rules: bool = False) -> dict:
         """Delete all rows from tables that represent a single bot run.
-        Keeps schema, learned_rules (unless reset_rules), parameter_adjustments, source_reliability."""
+        Keeps schema, learned_rules (unless reset_rules), parameter_adjustments, source_reliability.
+
+        Crypto-lag tables are also wiped so each restart starts with a clean
+        A/B between variants — without this, the 2.6M state-snapshot rows
+        from a prior run pollute the per-variant fill-rate / decision-mix
+        queries the audit relies on.
+        """
         c = self.conn.cursor()
         counts: dict[str, int] = {}
         tables = [
             "trades", "cycles", "trade_analyses", "opportunity_skips",
             "bet_evaluations", "forecast_snapshots", "weather_markets",
             "market_resolutions",
+            "crypto_lag_quotes", "crypto_lag_state_snapshots", "crypto_lag_closes",
         ]
         if reset_rules:
             tables.extend(["learned_rules", "parameter_adjustments", "source_reliability"])
@@ -1015,7 +1087,8 @@ class Database:
         try:
             c.execute("DELETE FROM sqlite_sequence WHERE name IN "
                       "('trades','cycles','trade_analyses','opportunity_skips',"
-                      "'bet_evaluations','forecast_snapshots')")
+                      "'bet_evaluations','forecast_snapshots',"
+                      "'crypto_lag_quotes','crypto_lag_state_snapshots','crypto_lag_closes')")
         except sqlite3.OperationalError:
             pass
         self.conn.commit()

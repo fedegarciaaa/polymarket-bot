@@ -215,6 +215,22 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             queue_position_enabled=bool(paper_cfg_v.get("queue_position_enabled", True)),
         )
         risk = CryptoLagRisk(variant_config_for_risk, get_bankroll_usdc=_bankroll)
+
+        # Placement logger: persist every acknowledged order to crypto_lag_quotes
+        # tagged with this variant. Closure captures `db` and `vname` so the
+        # engine doesn't need to know either. No-op if the DB doesn't expose
+        # the method (older deployments).
+        def _make_placement_logger(_db, _variant: str):
+            if _db is None or not hasattr(_db, "log_crypto_lag_placement"):
+                return None
+            def _log(order, queue_debt):
+                try:
+                    _db.log_crypto_lag_placement(order, queue_debt, variant=_variant)
+                except Exception as exc:
+                    logger.debug(f"placement logger ({_variant}) failed: {exc}")
+            return _log
+        placement_logger = _make_placement_logger(db, vname)
+
         engine = MakerOrderEngine(
             executor=executor,
             risk=risk,
@@ -226,6 +242,9 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             inventory_skew_threshold=float(eff.get("inventory_skew_threshold", 0.7)),
             fee_rate=float(eff.get("fee_rate", FEE_RATE_CRYPTO)),
             maker_rebate_share=float(eff.get("maker_rebate_share", MAKER_REBATE_SHARE)),
+            quote_mode=str(eff.get("quote_mode", "maker")),
+            cross_threshold_ticks=float(eff.get("cross_threshold_ticks", 4.0)),
+            placement_logger=placement_logger,
         )
         cycle = CryptoLagCycle(
             config=config, feed=feed, registry=registry, executor=executor,
@@ -240,6 +259,8 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
         # Operator-friendly summary line
         logger.info(
             f"crypto_lag variant {vname!r}: "
+            f"mode={eff.get('quote_mode', 'maker')} "
+            f"cross_thr={eff.get('cross_threshold_ticks', 4.0)}t "
             f"queue_pos={paper_cfg_v.get('queue_position_enabled', True)} "
             f"edge_thr={eff.get('edge_threshold_cents', 2)}c "
             f"q_toxic={paper_cfg_v.get('q_toxic', 0.30)}"

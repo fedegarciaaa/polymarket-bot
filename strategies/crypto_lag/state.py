@@ -97,6 +97,9 @@ class RestingOrder:
     strike_price: float = 0.0
     market_slug: str = ""
     tick_size: float = 0.01
+    # True when this order crossed the book at placement (IOC-taker style).
+    # Charges Polymarket's parabolic fee instead of crediting the maker rebate.
+    is_taker: bool = False
 
 
 @dataclass

@@ -118,6 +118,17 @@ class CryptoLagCycle:
         # Last hour-bucket we refit GARCH on, so we refit at most once per hour.
         self._garch_last_refit_hour: dict[str, int] = {}
 
+        # Hourly variant stats — see _emit_stats_if_due. We emit one
+        # CRYPTO_LAG_VARIANT_STATS event per variant per hour into events.jsonl
+        # so the analyses can show rolling fill-rate / pnl without reloading
+        # 2.6M state-snapshot rows.
+        self._stats_period_start: float = time.time()
+        self._fills_period: int = 0
+        self._gross_pnl_period: float = 0.0
+        self._fees_period: float = 0.0
+        self._rebates_period: float = 0.0
+        self._closes_period: int = 0
+
     async def run_forever(self) -> None:
         logger.info("crypto_lag cycle started")
         try:
@@ -127,6 +138,11 @@ class CryptoLagCycle:
                     await self._tick(t0)
                 except Exception as exc:
                     logger.exception(f"cycle tick error: {exc}")
+                # Emit hourly variant stats (cheap; checked once per tick).
+                try:
+                    self._emit_stats_if_due(t0)
+                except Exception as exc:
+                    logger.debug(f"stats emit error: {exc}")
                 # Sleep until next tick, accounting for tick duration
                 elapsed = time.time() - t0
                 wait = max(0.1, self.refresh_seconds - elapsed)
@@ -339,6 +355,9 @@ class CryptoLagCycle:
                 f"fill {f.symbol} {f.side} {f.outcome} {f.fill_size_usdc:.2f}@{f.fill_price:.4f} "
                 f"adverse={f.is_adverse}"
             )
+            self._fills_period += 1
+            self._fees_period += float(getattr(f, "fee_paid_usdc", 0.0) or 0.0)
+            self._rebates_period += float(getattr(f, "rebate_usdc", 0.0) or 0.0)
             self._record_trade(f, now)
             if self.notifier is not None:
                 try:
@@ -390,6 +409,8 @@ class CryptoLagCycle:
                 logger.info(
                     f"resolve {ev.symbol} {ev.condition_id[:12]}... pnl={ev.realized_pnl_usdc:+.3f}"
                 )
+                self._gross_pnl_period += float(ev.realized_pnl_usdc)
+                self._closes_period += 1
                 self._record_close(ev)
                 if self.notifier is not None:
                     try:
@@ -694,6 +715,66 @@ class CryptoLagCycle:
                 self.db.log_crypto_lag_close(ev, variant=self.variant)
             except TypeError:
                 self.db.log_crypto_lag_close(ev)
+        except Exception:
+            pass
+
+    # Period over which we accumulate variant stats before emitting the
+    # CRYPTO_LAG_VARIANT_STATS event. 1h matches the GARCH refit cadence and
+    # gives ~24 data points per day for offline analysis.
+    _STATS_PERIOD_S: float = 3600.0
+
+    def _emit_stats_if_due(self, now: float) -> None:
+        """Once per `_STATS_PERIOD_S`, write a per-variant rollup to events.jsonl
+        and reset the per-period counters. Cheap (<1 row write per hour per
+        variant). The structured logger may not be importable in some test
+        configurations; failures are swallowed to never fault the cycle."""
+        elapsed = now - self._stats_period_start
+        if elapsed < self._STATS_PERIOD_S:
+            return
+        # Snapshot before resetting so we don't race a fill during the write.
+        placements = int(getattr(self.engine, "placements_period", 0) or 0)
+        placements_taker = int(getattr(self.engine, "placements_period_taker", 0) or 0)
+        fills = self._fills_period
+        closes = self._closes_period
+        gross_pnl = round(self._gross_pnl_period, 4)
+        fees = round(self._fees_period, 4)
+        rebates = round(self._rebates_period, 4)
+        net_pnl = round(gross_pnl + rebates - fees, 4)
+        fill_rate = round(fills / placements, 4) if placements > 0 else 0.0
+
+        try:
+            from structured_logger import get_logger
+            slog = get_logger()
+            slog.log(
+                "CRYPTO_LAG_VARIANT_STATS",
+                f"crypto_lag.{self.variant}",
+                {
+                    "variant": self.variant,
+                    "quote_mode": getattr(self.engine, "quote_mode", "unknown"),
+                    "period_seconds": round(elapsed, 1),
+                    "placements": placements,
+                    "placements_taker": placements_taker,
+                    "fills": fills,
+                    "closes": closes,
+                    "fill_rate": fill_rate,
+                    "gross_pnl_usdc": gross_pnl,
+                    "fees_paid_usdc": fees,
+                    "rebates_usdc": rebates,
+                    "net_pnl_usdc": net_pnl,
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"variant stats event write failed: {exc}")
+
+        # Reset both sides of the counters so the next period is clean.
+        self._stats_period_start = now
+        self._fills_period = 0
+        self._closes_period = 0
+        self._gross_pnl_period = 0.0
+        self._fees_period = 0.0
+        self._rebates_period = 0.0
+        try:
+            self.engine.reset_period_counters()
         except Exception:
             pass
 

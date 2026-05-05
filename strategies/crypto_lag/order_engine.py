@@ -44,10 +44,36 @@ import math
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Awaitable, Callable, Optional, Protocol
 
 from .state import PolyCryptoMarket, RestingOrder
 from .risk import CryptoLagRisk
+
+
+# Quote modes — the engine branches on these in `build_decision_two_sided`.
+#
+#   maker             : legacy. Post-only inside the visible spread, clamped to
+#                       `[poly_bid + tick, poly_ask - tick]`. In 1-tick spreads
+#                       this collapses to top-of-book joining (back of queue) —
+#                       what the May-2026 audit showed produces 0 fills.
+#   penny_aggressive  : when the visible spread allows it (>= 2 ticks), post
+#                       1 tick INSIDE (true penny-jump). When the spread is
+#                       exactly 1 tick — the common case for crypto-lag 5/15m
+#                       markets — lift the opposite side (taker, paying fee)
+#                       provided the net edge exceeds `edge_threshold` and
+#                       `cross_threshold_ticks` × tick. Stays passive when the
+#                       book is wider than the model thinks is real.
+#   ioc_taker         : never quote passive. Cross the book whenever
+#                       `|fair_mid - poly_mid|` exceeds `cross_threshold_ticks`
+#                       × tick. Pays the Polymarket taker fee on every fill;
+#                       the A/B vs penny_aggressive measures whether the real
+#                       edge survives net of fees.
+QUOTE_MODE_MAKER = "maker"
+QUOTE_MODE_PENNY_AGGRESSIVE = "penny_aggressive"
+QUOTE_MODE_IOC_TAKER = "ioc_taker"
+_VALID_QUOTE_MODES = {
+    QUOTE_MODE_MAKER, QUOTE_MODE_PENNY_AGGRESSIVE, QUOTE_MODE_IOC_TAKER,
+}
 
 logger = logging.getLogger("polymarket_bot.crypto_lag.engine")
 
@@ -88,6 +114,32 @@ class _ExecutorProto(Protocol):
 
 
 @dataclass
+class _DecisionCtx:
+    """Internal: precomputed shared state passed into the per-mode decision
+    helpers. Public-facing fields (edges, reservation, half_spread) eventually
+    land on the QuoteDecision so the snapshot row keeps the same shape across
+    quote_modes — diagnostics queries don't need to special-case anything.
+    """
+    fair_mid: float
+    poly_best_bid: float
+    poly_best_ask: float
+    target_size_usdc: float
+    tick: float
+    edge_bid: float
+    edge_ask: float
+    edge_bid_net: float
+    edge_ask_net: float
+    reservation: float
+    half_spread: float
+    raw_bid: float
+    raw_ask: float
+    inv_blocks_bid: bool
+    inv_blocks_ask: bool
+    q_norm: float
+    inv_skew: float
+
+
+@dataclass
 class QuoteDecision:
     """Output of the decision step. The order_engine consumes this and the
     cycle persists it to the snapshot log for forensics.
@@ -115,6 +167,12 @@ class QuoteDecision:
     reservation_price: float = 0.0    # AS reservation price including inventory skew
     inventory_skew: float = 0.0       # AS skew that was applied (signed)
     half_spread: float = 0.0          # AS half-spread (>= 0)
+    # True when the BID leg crosses the book at placement (taker fee owed).
+    bid_is_taker: bool = False
+    # True when the ASK leg crosses the book at placement (taker fee owed).
+    ask_is_taker: bool = False
+    # Mode that produced this decision — propagated for logging/diagnostics.
+    mode: str = QUOTE_MODE_MAKER
 
 
 class MakerOrderEngine:
@@ -130,6 +188,9 @@ class MakerOrderEngine:
         inventory_skew_threshold: float = 0.7,
         fee_rate: float = FEE_RATE_CRYPTO,
         maker_rebate_share: float = MAKER_REBATE_SHARE,
+        quote_mode: str = QUOTE_MODE_MAKER,
+        cross_threshold_ticks: float = 4.0,
+        placement_logger: Optional[Callable[[RestingOrder, float], None]] = None,
     ):
         self.executor = executor
         self.risk = risk
@@ -149,8 +210,35 @@ class MakerOrderEngine:
         self.fee_rate = float(fee_rate)
         self.maker_rebate_share = float(maker_rebate_share)
 
+        # Quote-mode dispatch (see module-level docstring on QUOTE_MODE_*).
+        if quote_mode not in _VALID_QUOTE_MODES:
+            raise ValueError(
+                f"unknown quote_mode {quote_mode!r}; expected one of {_VALID_QUOTE_MODES}"
+            )
+        self.quote_mode = quote_mode
+        # Threshold (in TICKS, not cents) above which an aggressive mode will
+        # cross the book. For ioc_taker this is the only gate; for
+        # penny_aggressive it's only consulted in the 1-tick-spread branch.
+        self.cross_threshold_ticks = float(max(cross_threshold_ticks, 0.0))
+
+        # Optional callback fired for every order acknowledged by the executor.
+        # Used to persist placements to crypto_lag_quotes (status='placed') so
+        # we can compute fill-rate per variant without parsing the journal.
+        self.placement_logger = placement_logger
+
         # condition_id → side("BID"|"ASK") → RestingOrder
         self._open: dict[str, dict[str, RestingOrder]] = {}
+
+        # Lightweight per-period counters consumed by the cycle's hourly
+        # CRYPTO_LAG_VARIANT_STATS event. Reset by `reset_period_counters`.
+        self.placements_period: int = 0
+        self.placements_period_taker: int = 0
+        self.placements_lifetime: int = 0
+
+    def reset_period_counters(self) -> None:
+        """Zero per-period counters after the cycle emits its hourly stats."""
+        self.placements_period = 0
+        self.placements_period_taker = 0
 
     # ─── public API ─────────────────────────────────────────────
     async def reconcile(
@@ -183,6 +271,7 @@ class MakerOrderEngine:
                 await self._upsert(
                     market=market, side="BID", price=decision.bid_price,
                     size_usdc=bid_size, now=now,
+                    is_taker=bool(decision.bid_is_taker),
                 )
         # 4. (Re)place ASK
         if decision.side in ("ASK", "BOTH") and decision.ask_price is not None:
@@ -192,6 +281,7 @@ class MakerOrderEngine:
                 await self._upsert(
                     market=market, side="ASK", price=decision.ask_price,
                     size_usdc=ask_size, now=now,
+                    is_taker=bool(decision.ask_is_taker),
                 )
 
     async def cancel_all_for(self, condition_id: str) -> None:
@@ -258,23 +348,15 @@ class MakerOrderEngine:
         inventory_usdc: float = 0.0,
         per_market_max_inventory_usdc: float = 100.0,
     ) -> QuoteDecision:
-        """Two-sided maker quoting with Avellaneda-Stoikov reservation +
-        spread, plus fee-aware edge thresholds.
+        """Top-level decision builder. Computes the AS reservation/half-spread
+        and net edges once, then dispatches to the per-mode quote builder.
 
-        Reservation price (skews against inventory):
-            r = fair_mid - q_norm · γ · σ²·(T-t)
-        where q_norm = inventory_usdc / per_market_max_inventory_usdc ∈ [-1, 1].
-
-        Optimal half-spread:
-            δ = γ·σ²·(T-t)/2 + (1/γ)·ln(1 + γ/k)
-
-        Final quotes are floored/ceiled to stay inside Polymarket's visible
-        spread (always post-only) and rounded to the tick. Sides whose
-        fee-adjusted net edge is below `edge_threshold` are suppressed. If
-        the inventory penalty triggers, the inventory-deepening side is also
-        suppressed entirely.
+        See QUOTE_MODE_* constants at the top of this module for the semantics
+        of each mode. The shared fields on the returned QuoteDecision (edges,
+        rebates, AS reservation) are populated identically across modes so
+        diagnostics in the snapshot table work the same regardless.
         """
-        # ── 1. Reservation price + AS half-spread ──────────────
+        # ── 1. Reservation price + AS half-spread (shared across modes) ──
         sigma2_t = max(0.0, (sigma_per_sqrt_s ** 2) * float(max(t_remaining_s, 0.0)))
         denom = max(1e-6, float(per_market_max_inventory_usdc))
         q_norm = max(-1.0, min(1.0, float(inventory_usdc) / denom))
@@ -282,25 +364,15 @@ class MakerOrderEngine:
         inv_skew = q_norm * self.gamma * sigma2_t
         reservation = fair_mid - inv_skew
 
-        # γ is bounded away from 0 so this is well-defined.
         gamma_eff = max(self.gamma, 1e-3)
         half_spread = 0.5 * gamma_eff * sigma2_t + (1.0 / gamma_eff) * math.log(
             1.0 + gamma_eff / self.arrival_intensity_k
         )
-        # The AS optimal spread can balloon when σ²·T is large (early in a
-        # 1-hour market). Cap it at half the visible Polymarket spread so we
-        # never quote outside the book.
         visible_half_spread = max(0.0, 0.5 * (poly_best_ask - poly_best_bid))
-        # Allow up to 1.5× the visible half-spread so we can still quote
-        # tighter than chronic single-tick books while ditching wild values.
         half_spread = max(half_spread, float(tick))
         half_spread = min(half_spread, max(2.0 * float(tick), 1.5 * visible_half_spread))
 
-        # ── 2. Raw AS quotes around the reservation price ──────
-        raw_bid = reservation - half_spread
-        raw_ask = reservation + half_spread
-
-        # ── 3. Fee-aware edges (rebate boosts the edge) ────────
+        # ── 2. Fee-aware edges ─────────────────────────────────
         edge_bid = fair_mid - poly_best_bid
         edge_ask = poly_best_ask - fair_mid
         rebate_at_bid = expected_maker_rebate(
@@ -314,43 +386,143 @@ class MakerOrderEngine:
         edge_bid_net = edge_bid + rebate_at_bid
         edge_ask_net = edge_ask + rebate_at_ask
 
-        # ── 4. Inventory penalty: kill the inventory-deepening side
-        # when |q_norm| crosses the threshold ───────────────────
-        inv_blocks_bid = q_norm > self.inventory_skew_threshold   # too long → don't buy more
-        inv_blocks_ask = q_norm < -self.inventory_skew_threshold  # too short → don't sell more
+        # Inventory penalty: kill the inventory-deepening side
+        inv_blocks_bid = q_norm > self.inventory_skew_threshold
+        inv_blocks_ask = q_norm < -self.inventory_skew_threshold
 
-        # ── 5. Decide which sides we'll actually post ──────────
-        post_bid = (edge_bid_net > self.edge_threshold) and not inv_blocks_bid
-        post_ask = (edge_ask_net > self.edge_threshold) and not inv_blocks_ask
+        ctx = _DecisionCtx(
+            fair_mid=fair_mid,
+            poly_best_bid=poly_best_bid, poly_best_ask=poly_best_ask,
+            target_size_usdc=target_size_usdc, tick=float(tick),
+            edge_bid=edge_bid, edge_ask=edge_ask,
+            edge_bid_net=edge_bid_net, edge_ask_net=edge_ask_net,
+            reservation=reservation, half_spread=half_spread,
+            raw_bid=reservation - half_spread, raw_ask=reservation + half_spread,
+            inv_blocks_bid=inv_blocks_bid, inv_blocks_ask=inv_blocks_ask,
+            q_norm=q_norm, inv_skew=inv_skew,
+        )
 
+        if self.quote_mode == QUOTE_MODE_IOC_TAKER:
+            return self._decide_ioc_taker(ctx)
+        if self.quote_mode == QUOTE_MODE_PENNY_AGGRESSIVE:
+            return self._decide_penny_aggressive(ctx)
+        return self._decide_maker(ctx)
+
+    # ─── per-mode decision builders ──────────────────────────────────
+    def _decide_maker(self, c: "_DecisionCtx") -> QuoteDecision:
+        """Original strict maker. Post-only, clamped strictly inside the visible
+        spread. Joins top-of-queue when the visible spread is exactly 1 tick.
+        """
         bid_price: Optional[float] = None
         ask_price: Optional[float] = None
+        post_bid = (c.edge_bid_net > self.edge_threshold) and not c.inv_blocks_bid
+        post_ask = (c.edge_ask_net > self.edge_threshold) and not c.inv_blocks_ask
 
         if post_bid:
-            # Penny-jump if the edge is comfortable, else join the queue.
-            penny = poly_best_bid + tick if edge_bid_net >= 2.0 * tick else poly_best_bid
-            cand = max(raw_bid, penny)
-            ceiling = round(poly_best_ask - tick, 4) if poly_best_ask > 0 else 0.99
-            bid_price = _round_tick(
-                max(0.01, min(cand, ceiling, 0.99)), tick
-            )
+            penny = c.poly_best_bid + c.tick if c.edge_bid_net >= 2.0 * c.tick else c.poly_best_bid
+            cand = max(c.raw_bid, penny)
+            ceiling = round(c.poly_best_ask - c.tick, 4) if c.poly_best_ask > 0 else 0.99
+            bid_price = _round_tick(max(0.01, min(cand, ceiling, 0.99)), c.tick)
 
         if post_ask:
-            penny = poly_best_ask - tick if edge_ask_net >= 2.0 * tick else poly_best_ask
-            cand = min(raw_ask, penny)
-            floor_ = round(poly_best_bid + tick, 4) if poly_best_bid > 0 else 0.01
-            ask_price = _round_tick(
-                min(0.99, max(cand, floor_, 0.01)), tick
-            )
+            penny = c.poly_best_ask - c.tick if c.edge_ask_net >= 2.0 * c.tick else c.poly_best_ask
+            cand = min(c.raw_ask, penny)
+            floor_ = round(c.poly_best_bid + c.tick, 4) if c.poly_best_bid > 0 else 0.01
+            ask_price = _round_tick(min(0.99, max(cand, floor_, 0.01)), c.tick)
 
-        # If both candidate prices crossed (bid >= ask after clamping), prefer
-        # the side with the larger net edge and drop the other.
+        return self._finalize_decision(c, bid_price, ask_price,
+                                       bid_is_taker=False, ask_is_taker=False,
+                                       mode=QUOTE_MODE_MAKER)
+
+    def _decide_penny_aggressive(self, c: "_DecisionCtx") -> QuoteDecision:
+        """When the visible spread allows it (>= 2 ticks), post 1 tick INSIDE
+        as a true maker penny-jump. When the visible spread is exactly 1 tick
+        — the dominant case for crypto-lag 5/15m markets — lift the opposite
+        side as a taker provided net edge > max(edge_threshold, cross_threshold).
+
+        Crossed legs are flagged is_taker=True so the executor charges fees.
+        """
+        bid_price: Optional[float] = None
+        ask_price: Optional[float] = None
+        bid_is_taker = False
+        ask_is_taker = False
+
+        visible_spread = c.poly_best_ask - c.poly_best_bid
+        wide_book = visible_spread >= 1.5 * c.tick   # >= 2 ticks accounting for fp slop
+        cross_thr = max(self.edge_threshold, self.cross_threshold_ticks * c.tick)
+
+        post_bid = (c.edge_bid_net > self.edge_threshold) and not c.inv_blocks_bid
+        post_ask = (c.edge_ask_net > self.edge_threshold) and not c.inv_blocks_ask
+
+        if post_bid:
+            if wide_book:
+                # True penny-jump: post inside the visible spread.
+                cand = c.poly_best_bid + c.tick
+                ceiling = round(c.poly_best_ask - c.tick, 4)
+                bid_price = _round_tick(max(0.01, min(cand, ceiling, 0.99)), c.tick)
+            elif c.edge_bid_net > cross_thr and c.poly_best_ask > 0:
+                # Tight book: cross by 1 tick (lift the offer).
+                bid_price = _round_tick(min(0.99, c.poly_best_ask), c.tick)
+                bid_is_taker = True
+
+        if post_ask:
+            if wide_book:
+                cand = c.poly_best_ask - c.tick
+                floor_ = round(c.poly_best_bid + c.tick, 4)
+                ask_price = _round_tick(min(0.99, max(cand, floor_, 0.01)), c.tick)
+            elif c.edge_ask_net > cross_thr and c.poly_best_bid > 0:
+                ask_price = _round_tick(max(0.01, c.poly_best_bid), c.tick)
+                ask_is_taker = True
+
+        return self._finalize_decision(c, bid_price, ask_price,
+                                       bid_is_taker=bid_is_taker,
+                                       ask_is_taker=ask_is_taker,
+                                       mode=QUOTE_MODE_PENNY_AGGRESSIVE)
+
+    def _decide_ioc_taker(self, c: "_DecisionCtx") -> QuoteDecision:
+        """Cross-only mode. Lift the opposite side whenever the GROSS edge
+        (pre-rebate, since this leg pays a fee instead) exceeds
+        `cross_threshold_ticks * tick`. Never quote passively.
+        """
+        bid_price: Optional[float] = None
+        ask_price: Optional[float] = None
+        bid_is_taker = False
+        ask_is_taker = False
+
+        thr = self.cross_threshold_ticks * c.tick
+
+        # IOC-taker uses the GROSS edge: the rebate doesn't apply when crossing,
+        # and the fee is collected by the executor on fill.
+        if (c.edge_bid > thr and c.edge_bid > self.edge_threshold
+                and not c.inv_blocks_bid and c.poly_best_ask > 0):
+            bid_price = _round_tick(min(0.99, c.poly_best_ask), c.tick)
+            bid_is_taker = True
+
+        if (c.edge_ask > thr and c.edge_ask > self.edge_threshold
+                and not c.inv_blocks_ask and c.poly_best_bid > 0):
+            ask_price = _round_tick(max(0.01, c.poly_best_bid), c.tick)
+            ask_is_taker = True
+
+        return self._finalize_decision(c, bid_price, ask_price,
+                                       bid_is_taker=bid_is_taker,
+                                       ask_is_taker=ask_is_taker,
+                                       mode=QUOTE_MODE_IOC_TAKER)
+
+    def _finalize_decision(
+        self, c: "_DecisionCtx",
+        bid_price: Optional[float], ask_price: Optional[float],
+        bid_is_taker: bool, ask_is_taker: bool, mode: str,
+    ) -> QuoteDecision:
+        # If both candidate prices ended up crossed (bid >= ask), drop the side
+        # with the smaller net edge so we don't self-trade in a single tick.
         if bid_price is not None and ask_price is not None:
             if bid_price >= ask_price - 1e-9:
-                if edge_bid_net >= edge_ask_net:
+                if c.edge_bid_net >= c.edge_ask_net:
                     ask_price = None
+                    ask_is_taker = False
                 else:
                     bid_price = None
+                    bid_is_taker = False
 
         if bid_price is not None and ask_price is not None:
             side = "BOTH"
@@ -361,27 +533,27 @@ class MakerOrderEngine:
         else:
             side = "NONE"
 
-        # ── 6. Asymmetric sizing under inventory pressure ─────
         bid_size: Optional[float] = None
         ask_size: Optional[float] = None
         if side == "BOTH":
-            # Size each leg according to how much room we have on that side.
-            # Long inventory → smaller bid, larger ask (mean-revert toward 0).
-            tilt = q_norm  # ∈ [-1, 1]
-            bid_size = target_size_usdc * max(0.25, 1.0 - max(0.0, tilt))
-            ask_size = target_size_usdc * max(0.25, 1.0 + min(0.0, tilt))
+            tilt = c.q_norm
+            bid_size = c.target_size_usdc * max(0.25, 1.0 - max(0.0, tilt))
+            ask_size = c.target_size_usdc * max(0.25, 1.0 + min(0.0, tilt))
 
         return QuoteDecision(
-            side=side, fair_mid=fair_mid,
-            edge_bid=edge_bid, edge_ask=edge_ask,
-            poly_best_bid=poly_best_bid, poly_best_ask=poly_best_ask,
-            target_size_usdc=target_size_usdc,
+            side=side, fair_mid=c.fair_mid,
+            edge_bid=c.edge_bid, edge_ask=c.edge_ask,
+            poly_best_bid=c.poly_best_bid, poly_best_ask=c.poly_best_ask,
+            target_size_usdc=c.target_size_usdc,
             bid_price=bid_price, ask_price=ask_price,
             bid_size_usdc=bid_size, ask_size_usdc=ask_size,
-            edge_bid_net=edge_bid_net, edge_ask_net=edge_ask_net,
-            reservation_price=reservation,
-            inventory_skew=inv_skew,
-            half_spread=half_spread,
+            edge_bid_net=c.edge_bid_net, edge_ask_net=c.edge_ask_net,
+            reservation_price=c.reservation,
+            inventory_skew=c.inv_skew,
+            half_spread=c.half_spread,
+            bid_is_taker=bid_is_taker,
+            ask_is_taker=ask_is_taker,
+            mode=mode,
         )
 
     # ─── internals ──────────────────────────────────────────────
@@ -392,6 +564,7 @@ class MakerOrderEngine:
         price: float,
         size_usdc: float,
         now: float,
+        is_taker: bool = False,
     ) -> None:
         cid = market.condition_id
         existing = self._open.setdefault(cid, {}).get(side)
@@ -424,6 +597,7 @@ class MakerOrderEngine:
             strike_price=float(market.strike_price),
             market_slug=str(market.market_slug),
             tick_size=float(market.tick_size),
+            is_taker=bool(is_taker),
         )
         try:
             ext = await self.executor.place_order(order, market.token_yes)
@@ -436,10 +610,28 @@ class MakerOrderEngine:
             # otherwise.
             self._open.setdefault(cid, {})[side] = order
             self.risk.on_order_open()
+            taker_tag = " TAKER" if is_taker else ""
+            self.placements_period += 1
+            self.placements_lifetime += 1
+            if is_taker:
+                self.placements_period_taker += 1
             logger.info(
-                f"placed {side} {market.symbol} {market.market_slug[:30]}: "
+                f"placed {side}{taker_tag} {market.symbol} {market.market_slug[:30]}: "
                 f"{size_usdc:.2f}@{price:.4f} (ext={ext})"
             )
+            if self.placement_logger is not None:
+                # Persist this placement so the dashboard / analyses can compute
+                # fill-rate per variant without parsing the journal. Read the
+                # queue debt the simulator just initialized (real LIVE will
+                # report 0 for taker fills, which is consistent).
+                try:
+                    qd = 0.0
+                    getter = getattr(self.executor, "get_queue_debt", None)
+                    if getter is not None:
+                        qd = float(getter(order.order_id) or 0.0)
+                    self.placement_logger(order, qd)
+                except Exception as exc:
+                    logger.debug(f"placement_logger error: {exc}")
         except Exception as exc:
             logger.warning(
                 f"place {side} {market.market_slug}: {type(exc).__name__}: {exc}"

@@ -146,5 +146,104 @@ class TwoSidedDecisionTests(unittest.TestCase):
         self.assertIsNone(d.ask_price)
 
 
+class PennyAggressiveModeTests(unittest.TestCase):
+    """Mode that posts inside the spread when wide enough, crosses 1-tick books."""
+
+    def _engine(self, **kw):
+        return MakerOrderEngine(
+            executor=_DummyExec(), risk=_DummyRisk(),
+            edge_threshold_cents=kw.pop("edge_threshold_cents", 2.0),
+            cross_threshold_ticks=kw.pop("cross_threshold_ticks", 2.0),
+            quote_mode="penny_aggressive",
+            **kw,
+        )
+
+    def test_wide_book_penny_jumps_inside_as_maker(self):
+        # 2c spread (0.45/0.55) with bid edge of 5c → post inside spread,
+        # NOT as taker. is_taker should be False on the bid leg.
+        eng = self._engine()
+        d = eng.build_decision_two_sided(
+            fair_mid=0.55, poly_best_bid=0.45, poly_best_ask=0.55,
+            target_size_usdc=10.0, tick=0.01,
+            sigma_per_sqrt_s=1e-4, t_remaining_s=300.0,
+        )
+        self.assertEqual(d.mode, "penny_aggressive")
+        self.assertIsNotNone(d.bid_price)
+        # Strictly inside the visible spread (penny-jump from 0.45)
+        self.assertGreater(d.bid_price, 0.45 - 1e-9)
+        self.assertLess(d.bid_price, 0.55 - 1e-9)
+        self.assertFalse(d.bid_is_taker)
+
+    def test_one_tick_spread_crosses_when_edge_exceeds_threshold(self):
+        # 1c spread (0.50/0.51), fair=0.55 → strong bid edge. Maker mode
+        # would clamp to 0.50 (back of queue, never fills). Penny-aggressive
+        # should lift the offer at 0.51 with is_taker=True.
+        eng = self._engine(cross_threshold_ticks=2.0)
+        d = eng.build_decision_two_sided(
+            fair_mid=0.55, poly_best_bid=0.50, poly_best_ask=0.51,
+            target_size_usdc=10.0, tick=0.01,
+            sigma_per_sqrt_s=1e-4, t_remaining_s=300.0,
+        )
+        self.assertEqual(d.side, "BID")
+        self.assertAlmostEqual(d.bid_price, 0.51, places=6)
+        self.assertTrue(d.bid_is_taker)
+
+    def test_one_tick_spread_skips_when_edge_too_small(self):
+        # 1c spread, fair barely beats poly_bid by 1c → not enough edge to
+        # justify crossing. Should NOT post (no maker option exists either).
+        eng = self._engine(edge_threshold_cents=2.0, cross_threshold_ticks=2.0)
+        d = eng.build_decision_two_sided(
+            fair_mid=0.512, poly_best_bid=0.50, poly_best_ask=0.51,
+            target_size_usdc=10.0, tick=0.01,
+            sigma_per_sqrt_s=1e-4, t_remaining_s=300.0,
+        )
+        self.assertEqual(d.side, "NONE")
+
+
+class IocTakerModeTests(unittest.TestCase):
+    """Cross-only mode. Uses gross edge (no rebate) to gate aggressive lifts."""
+
+    def _engine(self, **kw):
+        return MakerOrderEngine(
+            executor=_DummyExec(), risk=_DummyRisk(),
+            edge_threshold_cents=kw.pop("edge_threshold_cents", 4.0),
+            cross_threshold_ticks=kw.pop("cross_threshold_ticks", 4.0),
+            quote_mode="ioc_taker",
+            **kw,
+        )
+
+    def test_strong_bid_edge_lifts_offer_as_taker(self):
+        # fair_mid 0.57 vs ask 0.51 → gross bid edge 6c, above 4-tick threshold.
+        # Should cross at poly_ask (0.51) flagged as taker.
+        eng = self._engine()
+        d = eng.build_decision_two_sided(
+            fair_mid=0.57, poly_best_bid=0.50, poly_best_ask=0.51,
+            target_size_usdc=10.0, tick=0.01,
+            sigma_per_sqrt_s=1e-4, t_remaining_s=300.0,
+        )
+        self.assertEqual(d.side, "BID")
+        self.assertAlmostEqual(d.bid_price, 0.51, places=6)
+        self.assertTrue(d.bid_is_taker)
+
+    def test_thin_gross_edge_skips(self):
+        # fair_mid 0.52 → gross bid edge 2c, below 4-tick gate. No post.
+        eng = self._engine()
+        d = eng.build_decision_two_sided(
+            fair_mid=0.52, poly_best_bid=0.50, poly_best_ask=0.51,
+            target_size_usdc=10.0, tick=0.01,
+            sigma_per_sqrt_s=1e-4, t_remaining_s=300.0,
+        )
+        self.assertEqual(d.side, "NONE")
+        self.assertFalse(d.bid_is_taker)
+        self.assertFalse(d.ask_is_taker)
+
+    def test_mode_rejects_unknown(self):
+        with self.assertRaises(ValueError):
+            MakerOrderEngine(
+                executor=_DummyExec(), risk=_DummyRisk(),
+                quote_mode="not_a_real_mode",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

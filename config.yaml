@@ -301,22 +301,36 @@ crypto_lag:
     consecutive_losses: 5
     realized_vol_multiplier: 3.0
     halt_file: "data/crypto_lag.halt"   # crear este archivo → para todo
-  # ─── Multi-variant shadow mode ───────────────────────────────
-  # Cada variant corre en paralelo en el mismo event loop (compartiendo
-  # feed Binance + registry Polymarket) pero con su propio simulator,
-  # engine y risk state. Las KPIs se loguean por separado en la DB
-  # (columna `variant`) y el dashboard muestra una sección por variant.
+  # ─── Multi-variant A/B (May 2026 audit follow-up) ─────────────
+  # Después de 2,4 días en `quote_mode: maker` puro: 1.367.685 placements,
+  # 0 fills, 0 closes. Las quotes acababan siempre en el top of book detrás
+  # de la cola y los markets de 5/15 min resolvían antes de que la cola
+  # rotara. Mantener el modo `maker` original sería seguir tirando ciclos
+  # sin generar resultados para comparar.
   #
-  # Si quitas este bloque entero el runner cae al modo legacy con un
-  # único variant llamado "main" (compat hacia atras).
+  # En su lugar, las dos variants ahora prueban dos filosofías AGRESIVAS
+  # ortogonales sobre los mismos mercados, compartiendo feed/registry/IV:
+  #   - main:        penny_aggressive — penny-jump dentro del libro cuando
+  #                  hay hueco (>= 2 ticks); cruzar 1 tick (taker) cuando
+  #                  el spread es 1c y el net edge supera el threshold.
+  #   - permissive:  ioc_taker — solo cruza el libro pagando fee, y solo
+  #                  cuando |fair_mid - mid| supera 4 ticks. Test del
+  #                  edge real post-fees.
+  #
+  # Ambas dejan trazabilidad completa en `crypto_lag_quotes` (status='placed'
+  # vs 'filled', is_taker, fee/rebate, queue_debt) para comparativa directa.
   variants:
-    main: {}                     # usa los defaults de arriba (estricto, fiel)
+    main:
+      quote_mode: penny_aggressive
+      edge_threshold_cents: 2          # min net edge para cualquier post
+      cross_threshold_ticks: 2.0       # ticks adicionales para cruzar en libros 1c
+      # paper.queue_position_enabled=true (default) → la cola sí cuenta
+      # cuando hacemos penny-jump dentro del libro.
     permissive:
-      # Simulador optimista para validar la pipeline end-to-end (fills,
-      # closes, PnL, dashboard) cuando el flow real de Polymarket es escaso.
-      # NO PROMOCIONAR a LIVE en base a estos datos: relajan supuestos.
-      edge_threshold_cents: 1
-      replace_threshold_cents: 0.5
+      quote_mode: ioc_taker
+      edge_threshold_cents: 4          # gross edge mínimo (sin rebate, pagamos fee)
+      cross_threshold_ticks: 4.0       # 4c → ~doble de la fee típica en p=0.5
       paper:
-        queue_position_enabled: false  # ignora cola: fills al cruzar precio
-        q_toxic: 0.10                  # menos fills marcados adverse
+        queue_position_enabled: false  # IOC nunca tiene cola
+        q_toxic: 0.30                  # mantener q_toxic alto: cruzar el libro
+                                       # captura más adverse selection real
