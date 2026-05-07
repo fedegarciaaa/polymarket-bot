@@ -327,6 +327,19 @@ class Database:
                 variant TEXT NOT NULL DEFAULT 'main'
             )
         """)
+        # Per-variant capital state (Fase 1, May 2026). Persists bankroll +
+        # lifetime PnL across restarts so the gross-cap accounting survives.
+        # `reset_on_start` deletes rows from this table at boot — see
+        # main.py reset path.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_lag_variant_state (
+                variant TEXT PRIMARY KEY,
+                bankroll_usdc REAL NOT NULL,
+                realized_pnl_lifetime_usdc REAL NOT NULL DEFAULT 0,
+                gross_filled_lifetime_usdc REAL NOT NULL DEFAULT 0,
+                last_update_ts REAL NOT NULL
+            )
+        """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_quotes_ts ON crypto_lag_quotes(ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_quotes_cond ON crypto_lag_quotes(condition_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_clag_snap_ts ON crypto_lag_state_snapshots(ts)")
@@ -481,6 +494,58 @@ class Database:
                 str(variant),
             ),
         )
+        self.conn.commit()
+
+    # ─── crypto_lag variant state (Fase 1: bankroll persistence) ────────
+    def upsert_crypto_lag_variant_state(
+        self,
+        variant: str,
+        bankroll_usdc: float,
+        realized_pnl_lifetime_usdc: float,
+        gross_filled_lifetime_usdc: float,
+    ) -> None:
+        """Persist a variant's bankroll + lifetime counters. Called periodically
+        by the cycle so a crash/restart resumes from the last snapshot.
+        """
+        import time as _t
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT INTO crypto_lag_variant_state
+               (variant, bankroll_usdc, realized_pnl_lifetime_usdc, gross_filled_lifetime_usdc, last_update_ts)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(variant) DO UPDATE SET
+                 bankroll_usdc = excluded.bankroll_usdc,
+                 realized_pnl_lifetime_usdc = excluded.realized_pnl_lifetime_usdc,
+                 gross_filled_lifetime_usdc = excluded.gross_filled_lifetime_usdc,
+                 last_update_ts = excluded.last_update_ts""",
+            (
+                str(variant),
+                float(bankroll_usdc),
+                float(realized_pnl_lifetime_usdc),
+                float(gross_filled_lifetime_usdc),
+                _t.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def get_crypto_lag_variant_state(self, variant: str) -> Optional[dict]:
+        """Return the persisted state for a variant, or None if never written."""
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT variant, bankroll_usdc, realized_pnl_lifetime_usdc,
+                      gross_filled_lifetime_usdc, last_update_ts
+               FROM crypto_lag_variant_state WHERE variant = ?""",
+            (str(variant),),
+        )
+        row = c.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def reset_crypto_lag_variant_states(self) -> None:
+        """Clear all per-variant state. Called on `reset_on_start: true`."""
+        c = self.conn.cursor()
+        c.execute("DELETE FROM crypto_lag_variant_state")
         self.conn.commit()
 
     def _ensure_trade_columns(self):

@@ -226,6 +226,24 @@ notifications:
 crypto_lag:
   enabled: true                 # OFF por defecto — activar tras validación
   mode: DEMO                     # DEMO | LIVE — DEMO simula fills contra orderbook real
+  # ─── Fase 1 (May 2026): capital tracking por variante ──────────────
+  # Cada variante tiene su propio bankroll virtual ($1000 por defecto) que
+  # se decrementa con realized losses on_close. Override por variante con
+  # `variants.<name>.bankroll_usdc`.
+  bankroll_usdc_default: 1000.0
+  # Cap del GROSS notional rotado por (variant, condition_id). Antes existía
+  # solo un cap NET (`per_market_max_inventory_usdc`) que un BUY+SELL ciclo
+  # cancelaba a 0; el resultado fue $5,093 de gross filled en un solo cid.
+  per_market_max_gross_usdc: 50
+  # Cap de exposición simultánea (suma de |signed| en open positions +
+  # in-flight placements). Convierte "$1000 bankroll" en "nunca más de
+  # $200 comprometidos a la vez".
+  variant_max_committed_usdc: 200
+  # Tripwire de churn: si una variante coloca más de N órdenes por minuto,
+  # halt automático hasta el siguiente reset diario.
+  placements_per_minute_limit: 100
+  # Si bankroll cae bajo este suelo, halt definitivo de la variante.
+  bankroll_floor_usdc: 100
   capital_pct: 0.30              # max % del bankroll que puede usar este módulo
   # Multi-horizonte: aceptamos markets 5m, 15m y 1h. El de 5m tiene mejor edge
   # pero menos liquidez; 15m y 1h equilibran. Si quieres uno solo, deja
@@ -256,8 +274,18 @@ crypto_lag:
   refresh_seconds: 3             # cadencia del cycle async
   market_poll_seconds: 30        # cada cuánto refrescar lista de mercados activos
   edge_threshold_cents: 2        # min edge (en cents de 0.01) para colocar maker
-  replace_threshold_cents: 1     # cancel-and-replace si drift > N cents
-  max_order_age_seconds: 30
+  # Fase 2 anti-churn: subido de 1c→2c. Antes cualquier desplazamiento de 1
+  # tick disparaba cancel-and-replace; con tick=1c y mercados que se mueven
+  # >1c en segundos, eso generó 270k placements / 26k fills (9.7% fill rate).
+  replace_threshold_cents: 2
+  # Subido de 30s→60s: si la decisión sigue alineada (mismo precio, mismo
+  # size), dejar viva la orden el doble de tiempo para que la cola drene
+  # — la única forma de conseguir maker fills (hoy es 0).
+  max_order_age_seconds: 60
+  # NUEVO Fase 2: debounce duro por (cid, side). Aunque el modelo cambie,
+  # nunca reemplazar una orden colocada hace menos de N segundos. Frena
+  # las cascadas de cancel-and-replace en ticks consecutivos.
+  min_replace_interval_seconds: 5
   max_order_usdc: 25             # tope por orden (LIVE: empezar en 5)
   per_market_max_inventory_usdc: 100
   max_concurrent_orders: 12      # con two-sided podemos abrir 2 por market
@@ -321,12 +349,21 @@ crypto_lag:
   # vs 'filled', is_taker, fee/rebate, queue_debt) para comparativa directa.
   variants:
     main:
+      bankroll_usdc: 1000.0            # bankroll per variant ($1000)
       quote_mode: penny_aggressive
       edge_threshold_cents: 2          # min net edge para cualquier post
       cross_threshold_ticks: 2.0       # ticks adicionales para cruzar en libros 1c
       # paper.queue_position_enabled=true (default) → la cola sí cuenta
       # cuando hacemos penny-jump dentro del libro.
     permissive:
+      # APAGADO 2026-05-07: tras 48h de paper trading acumuló −$19,714 con
+      # $26k de fees pagados sobre $1.46M de gross filled. Win rate 50.2%
+      # × edge bruto 4 ticks no cubre la parabolic fee de Polymarket
+      # (~7.2% peak en p=0.5). El problema es estructural del modo taker
+      # puro a estos thresholds, no de tuning. Reactivable tras Fase 3
+      # con edge_threshold_cents ≥ 8 si los datos lo justifican.
+      enabled: false
+      bankroll_usdc: 1000.0            # ignorado mientras enabled=false
       quote_mode: ioc_taker
       edge_threshold_cents: 4          # gross edge mínimo (sin rebate, pagamos fee)
       cross_threshold_ticks: 4.0       # 4c → ~doble de la fee típica en p=0.5

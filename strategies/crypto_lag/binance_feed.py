@@ -164,18 +164,35 @@ class BinanceFeed:
         return f"{base_url}?streams={'/'.join(streams)}"
 
     async def _run_forever(self) -> None:
+        # Stability-aware reconnect:
+        #   - `unstable_failures`: short-lived sessions (<STABLE_SESSION_S) count as
+        #     URL quality failures; rotate URL after ROTATE_AFTER of these.
+        #   - A session that lives ≥STABLE_SESSION_S resets `unstable_failures`,
+        #     because that URL is working — the disconnect is just normal jitter.
+        # The previous logic reset on EVERY successful connect, so a URL that
+        # accepts the handshake but drops 3s later (server-side pong timeout
+        # under residential ISP jitter) would never rotate. That's exactly what
+        # happened on 2026-05-07: 8h+ stuck on the fallback URL with reconnects
+        # every 1-5 min without ever rotating back to primary.
+        STABLE_SESSION_S = 60.0
+        ROTATE_AFTER = 3
         backoff = self.reconnect_initial
-        consecutive_failures = 0
+        unstable_failures = 0
         while not self._stop.is_set():
             base = self.ws_url
             url = self._build_stream_url(base)
+            session_start = time.time()
             try:
                 logger.info(f"connecting to Binance WS at {base} ({len(self.symbols)} symbols)")
                 async with websockets.connect(
-                    url, ping_interval=20, ping_timeout=10, open_timeout=15
+                    url,
+                    # Residential ISPs can have 5-15s of jitter; tighter ping
+                    # timeouts cause spurious 1008 pong timeouts on both sides.
+                    ping_interval=30,
+                    ping_timeout=20,
+                    open_timeout=15,
                 ) as ws:
-                    backoff = self.reconnect_initial  # reset on successful connect
-                    consecutive_failures = 0
+                    backoff = self.reconnect_initial  # reset transient backoff
                     async for raw in ws:
                         if self._stop.is_set():
                             break
@@ -185,21 +202,30 @@ class BinanceFeed:
                             logger.warning(f"handler error: {exc}")
             except (ConnectionClosed, OSError) as exc:
                 logger.warning(f"WS disconnect ({base}): {exc} — reconnecting in {backoff:.1f}s")
-                consecutive_failures += 1
             except Exception as exc:
                 logger.error(f"WS error ({base}): {exc} — reconnecting in {backoff:.1f}s")
-                consecutive_failures += 1
             finally:
                 if self._stop.is_set():
                     break
+                session_age = time.time() - session_start
+                if session_age >= STABLE_SESSION_S:
+                    # Long-lived session — URL is healthy, this is jitter.
+                    unstable_failures = 0
+                else:
+                    unstable_failures += 1
+                    logger.debug(
+                        f"unstable session: {session_age:.1f}s on {base} "
+                        f"(unstable_failures={unstable_failures}/{ROTATE_AFTER})"
+                    )
                 # mark a freeze window so consumers don't quote on stale data
                 # immediately after reconnect (Binance can replay or skip ticks)
                 self._reconnect_freeze_until = time.time() + 2.0 * 5.0
-                # Rotate to the next URL after 3 consecutive failures.
-                if consecutive_failures >= 3 and len(self._ws_urls) > 1:
+                # Rotate to the next URL when this URL keeps producing flaky
+                # sessions back-to-back.
+                if unstable_failures >= ROTATE_AFTER and len(self._ws_urls) > 1:
                     self._url_idx = (self._url_idx + 1) % len(self._ws_urls)
-                    consecutive_failures = 0
-                    logger.warning(f"rotating to fallback Binance URL: {self.ws_url}")
+                    unstable_failures = 0
+                    logger.warning(f"rotating Binance WS URL: {self.ws_url}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.reconnect_max)
         logger.info("Binance feed stopped")

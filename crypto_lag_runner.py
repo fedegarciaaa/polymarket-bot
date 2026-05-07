@@ -109,8 +109,10 @@ class CryptoLagHandle:
 def _resolve_variants(cfg: dict) -> dict[str, dict]:
     """Return the {variant_name: overrides_dict} mapping to spawn.
 
-    Falls back to {"main": {}} if no `variants:` block is present, so legacy
-    deployments keep working unchanged.
+    Variants with `enabled: false` are skipped. Falls back to {"main": {}} if
+    no `variants:` block is present, so legacy deployments keep working.
+    If every variant in the block is disabled, returns {} (caller should treat
+    as "nothing to run" and not start the module).
     """
     variants = cfg.get("variants")
     if not variants:
@@ -119,7 +121,14 @@ def _resolve_variants(cfg: dict) -> dict[str, dict]:
         return {"main": {}}
     out: dict[str, dict] = {}
     for name, overrides in variants.items():
-        out[str(name)] = dict(overrides or {})
+        ov = dict(overrides or {})
+        # Default enabled=true; explicit `enabled: false` skips this variant.
+        if ov.get("enabled", True) is False:
+            continue
+        out[str(name)] = ov
+    if not out and variants:
+        # Every variant was disabled — return {} so the caller can refuse to start.
+        return {}
     if not out:
         return {"main": {}}
     return out
@@ -188,16 +197,25 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             logger.warning(f"crypto_lag: DeribitIVProvider init failed: {exc}")
             deribit_iv = None
 
-    def _bankroll() -> float:
+    # Default bankroll per variant — variants override via `bankroll_usdc`.
+    default_bankroll_usdc = float(
+        cfg.get("bankroll_usdc_default",
+                config.get("bot", {}).get("demo_capital", 1000.0))
+    )
+    # On reset_on_start, wipe persisted variant state so we boot from defaults.
+    reset_on_start = bool(config.get("bot", {}).get("reset_on_start", False))
+    if reset_on_start and db is not None and hasattr(db, "reset_crypto_lag_variant_states"):
         try:
-            if hasattr(db, "get_bankroll"):
-                return float(db.get_bankroll() or 0.0)
-        except Exception:
-            pass
-        return float(config.get("bot", {}).get("demo_capital", 1000.0))
+            db.reset_crypto_lag_variant_states()
+            logger.info("crypto_lag: cleared persisted variant state (reset_on_start=true)")
+        except Exception as exc:
+            logger.warning(f"crypto_lag: reset_crypto_lag_variant_states failed: {exc}")
 
     # ─── per-variant stacks ────────────────────────────────────
     variants_cfg = _resolve_variants(cfg)
+    if not variants_cfg:
+        logger.warning("crypto_lag: every variant is disabled (enabled=false); skipping start")
+        return None
     variants: dict[str, VariantHandle] = {}
     for vname, voverrides in variants_cfg.items():
         # Build the effective config for this variant: deep-merge global
@@ -214,7 +232,29 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             maker_rebate_share=float(eff.get("maker_rebate_share", MAKER_REBATE_SHARE)),
             queue_position_enabled=bool(paper_cfg_v.get("queue_position_enabled", True)),
         )
-        risk = CryptoLagRisk(variant_config_for_risk, get_bankroll_usdc=_bankroll)
+
+        # Per-variant bankroll: prefer the per-variant override, fall back to
+        # the global default. If reset_on_start is false AND we have persisted
+        # state, restore it to survive crashes/restarts.
+        configured_bankroll = float(eff.get("bankroll_usdc", default_bankroll_usdc))
+        initial_bankroll = configured_bankroll
+        if not reset_on_start and db is not None and hasattr(db, "get_crypto_lag_variant_state"):
+            try:
+                persisted = db.get_crypto_lag_variant_state(vname)
+                if persisted is not None:
+                    initial_bankroll = float(persisted["bankroll_usdc"])
+                    logger.info(
+                        f"crypto_lag variant {vname!r}: restored bankroll "
+                        f"${initial_bankroll:.2f} from persisted state"
+                    )
+            except Exception as exc:
+                logger.debug(f"variant state restore ({vname}) failed: {exc}")
+
+        risk = CryptoLagRisk(
+            variant_config_for_risk,
+            bankroll_usdc=initial_bankroll,
+            variant_name=vname,
+        )
 
         # Placement logger: persist every acknowledged order to crypto_lag_quotes
         # tagged with this variant. Closure captures `db` and `vname` so the
@@ -237,6 +277,7 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             edge_threshold_cents=float(eff.get("edge_threshold_cents", 2.0)),
             replace_threshold_cents=float(eff.get("replace_threshold_cents", 1.0)),
             max_order_age_seconds=float(eff.get("max_order_age_seconds", 30.0)),
+            min_replace_interval_seconds=float(eff.get("min_replace_interval_seconds", 5.0)),
             gamma=float(eff.get("gamma", 0.10)),
             arrival_intensity_k=float(eff.get("arrival_intensity_k", 1.5)),
             inventory_skew_threshold=float(eff.get("inventory_skew_threshold", 0.7)),

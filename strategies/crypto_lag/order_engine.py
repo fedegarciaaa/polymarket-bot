@@ -183,6 +183,7 @@ class MakerOrderEngine:
         edge_threshold_cents: float = 2.0,
         replace_threshold_cents: float = 1.0,
         max_order_age_seconds: float = 30.0,
+        min_replace_interval_seconds: float = 5.0,
         gamma: float = 0.10,
         arrival_intensity_k: float = 1.5,
         inventory_skew_threshold: float = 0.7,
@@ -197,6 +198,13 @@ class MakerOrderEngine:
         self.edge_threshold = edge_threshold_cents / 100.0
         self.replace_threshold = replace_threshold_cents / 100.0
         self.max_order_age = max_order_age_seconds
+        # Fase 2 anti-churn: minimum interval between replacements on the
+        # same (cid, side). Even if drift exceeds replace_threshold or the
+        # decision changes, we will NOT cancel-and-replace if the existing
+        # order is younger than this. Prevents the rapid-fire replacement
+        # cascades that produced 270k placements / 26k fills (9.7%) in the
+        # 48h baseline.
+        self.min_replace_interval_s = float(max(0.0, min_replace_interval_seconds))
 
         # Avellaneda-Stoikov tunables. γ is risk aversion; k is the order
         # arrival intensity. They calibrate jointly with the spread, and the
@@ -234,11 +242,19 @@ class MakerOrderEngine:
         self.placements_period: int = 0
         self.placements_period_taker: int = 0
         self.placements_lifetime: int = 0
+        # Fase 2: track noop vs actual-replace decisions in `_upsert` so the
+        # hourly stats can show the churn ratio (high noop = healthy).
+        self.upsert_noop_period: int = 0
+        self.upsert_replace_period: int = 0
+        self.upsert_debounce_period: int = 0
 
     def reset_period_counters(self) -> None:
         """Zero per-period counters after the cycle emits its hourly stats."""
         self.placements_period = 0
         self.placements_period_taker = 0
+        self.upsert_noop_period = 0
+        self.upsert_replace_period = 0
+        self.upsert_debounce_period = 0
 
     # ─── public API ─────────────────────────────────────────────
     async def reconcile(
@@ -574,8 +590,19 @@ class MakerOrderEngine:
             drift = abs(existing.price - price)
             if drift < self.replace_threshold and age < self.max_order_age \
                and abs(existing.size_usdc - size_usdc) < 0.01:
+                # No meaningful change — keep existing order alive. This is the
+                # healthy path; high noop ratio means the model is stable.
+                self.upsert_noop_period += 1
+                return
+            # Fase 2 debounce: even when drift / size warrants replacement,
+            # don't cancel-and-replace if the existing order is younger than
+            # `min_replace_interval_s`. Lets resting orders breathe long enough
+            # for the queue to drain and become eligible for a maker fill.
+            if age < self.min_replace_interval_s:
+                self.upsert_debounce_period += 1
                 return
             # Cancel before replace
+            self.upsert_replace_period += 1
             await self._cancel(cid, side)
         # Place fresh
         # YES BID = BUY YES at `price`. YES ASK = SELL YES at `price`.
@@ -610,6 +637,9 @@ class MakerOrderEngine:
             # otherwise.
             self._open.setdefault(cid, {})[side] = order
             self.risk.on_order_open()
+            # Reserve in-flight commitment so the variant cap counts pending
+            # orders, not just filled exposure.
+            self.risk.on_placement(size_usdc, now_ts=now)
             taker_tag = " TAKER" if is_taker else ""
             self.placements_period += 1
             self.placements_lifetime += 1
@@ -644,6 +674,11 @@ class MakerOrderEngine:
         try:
             await self.executor.cancel_order(existing.order_id)
             self.risk.on_order_close()
+            # Free the unfilled remainder of the in-flight commit. Filled size
+            # was already released by on_fill; only the open size should free.
+            unfilled = max(0.0, float(existing.size_usdc) - float(getattr(existing, "filled_size_usdc", 0.0)))
+            if unfilled > 0:
+                self.risk.on_cancel(unfilled)
         except Exception as exc:
             logger.warning(f"cancel {side} {condition_id[:12]}...: {exc}")
         finally:

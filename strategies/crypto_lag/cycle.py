@@ -350,7 +350,9 @@ class CryptoLagCycle:
             fills = []
         for f in fills:
             signed = f.fill_size_usdc if f.side == "BUY" else -f.fill_size_usdc
-            self.risk.on_fill(f.condition_id, signed)
+            # Pass both signed (for inventory/skew) and absolute size (for
+            # gross-cap accounting and in-flight commitment release).
+            self.risk.on_fill(f.condition_id, signed, size_usdc=f.fill_size_usdc)
             logger.info(
                 f"fill {f.symbol} {f.side} {f.outcome} {f.fill_size_usdc:.2f}@{f.fill_price:.4f} "
                 f"adverse={f.is_adverse}"
@@ -405,7 +407,8 @@ class CryptoLagCycle:
                 yes_value = 1.0 if st.mid >= strike else 0.0
             ev = await self.executor.resolve_market(cid, yes_value, ts=now)
             if ev is not None:
-                self.risk.on_close(ev.realized_pnl_usdc)
+                # New signature: on_close needs cid to purge per-cid gross/exposure.
+                self.risk.on_close(ev.condition_id, ev.realized_pnl_usdc)
                 logger.info(
                     f"resolve {ev.symbol} {ev.condition_id[:12]}... pnl={ev.realized_pnl_usdc:+.3f}"
                 )
@@ -734,6 +737,9 @@ class CryptoLagCycle:
         # Snapshot before resetting so we don't race a fill during the write.
         placements = int(getattr(self.engine, "placements_period", 0) or 0)
         placements_taker = int(getattr(self.engine, "placements_period_taker", 0) or 0)
+        upsert_noop = int(getattr(self.engine, "upsert_noop_period", 0) or 0)
+        upsert_replace = int(getattr(self.engine, "upsert_replace_period", 0) or 0)
+        upsert_debounce = int(getattr(self.engine, "upsert_debounce_period", 0) or 0)
         fills = self._fills_period
         closes = self._closes_period
         gross_pnl = round(self._gross_pnl_period, 4)
@@ -741,6 +747,12 @@ class CryptoLagCycle:
         rebates = round(self._rebates_period, 4)
         net_pnl = round(gross_pnl + rebates - fees, 4)
         fill_rate = round(fills / placements, 4) if placements > 0 else 0.0
+
+        risk_snapshot = {}
+        try:
+            risk_snapshot = self.risk.snapshot()
+        except Exception as exc:
+            logger.debug(f"risk snapshot failed: {exc}")
 
         try:
             from structured_logger import get_logger
@@ -761,10 +773,32 @@ class CryptoLagCycle:
                     "fees_paid_usdc": fees,
                     "rebates_usdc": rebates,
                     "net_pnl_usdc": net_pnl,
+                    "bankroll_usdc": risk_snapshot.get("bankroll_usdc"),
+                    "committed_now_usdc": risk_snapshot.get("committed_now_usdc"),
+                    "available_committed_usdc": risk_snapshot.get("available_committed_usdc"),
+                    "open_markets": risk_snapshot.get("open_markets"),
+                    # Fase 2 churn diagnostics
+                    "upsert_noop": upsert_noop,
+                    "upsert_replace": upsert_replace,
+                    "upsert_debounce": upsert_debounce,
                 },
             )
         except Exception as exc:
             logger.debug(f"variant stats event write failed: {exc}")
+
+        # Fase 1: persist per-variant bankroll/PnL so a restart resumes from
+        # the latest snapshot. Cheap (single UPSERT per variant per period).
+        if self.db is not None and hasattr(self.db, "upsert_crypto_lag_variant_state") \
+                and risk_snapshot:
+            try:
+                self.db.upsert_crypto_lag_variant_state(
+                    variant=self.variant,
+                    bankroll_usdc=risk_snapshot["bankroll_usdc"],
+                    realized_pnl_lifetime_usdc=risk_snapshot["realized_pnl_lifetime_usdc"],
+                    gross_filled_lifetime_usdc=risk_snapshot["gross_filled_lifetime_usdc"],
+                )
+            except Exception as exc:
+                logger.debug(f"variant state persist ({self.variant}) failed: {exc}")
 
         # Reset both sides of the counters so the next period is clean.
         self._stats_period_start = now

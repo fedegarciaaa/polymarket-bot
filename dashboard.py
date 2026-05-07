@@ -281,12 +281,28 @@ def _configured_variants() -> list[str]:
 def api_crypto_lag_variants():
     """List all configured variants and how many snapshots/closes each one
     has logged. Used by the dashboard JS to know which sections to render.
+
+    Fase 1: include persisted per-variant capital state (bankroll, lifetime
+    PnL, gross filled) when available.
     """
     d = db()
     out = []
     has_var = _has_crypto_lag_tables(d.conn) and _has_variant_column(d.conn)
+    # Detect new variant_state table (best-effort; older DBs may not have it).
+    try:
+        has_state_table = bool(d.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='crypto_lag_variant_state'"
+        ).fetchone())
+    except Exception:
+        has_state_table = False
     for v in _configured_variants():
-        rec = {"name": v, "snapshots": 0, "closes": 0, "fills_24h": 0}
+        rec = {
+            "name": v, "snapshots": 0, "closes": 0, "fills_24h": 0,
+            "bankroll_usdc": None,
+            "realized_pnl_lifetime_usdc": None,
+            "gross_filled_lifetime_usdc": None,
+            "bankroll_last_update_ts": None,
+        }
         if has_var:
             try:
                 cutoff_24h = datetime.now(timezone.utc).timestamp() - 86400
@@ -304,6 +320,21 @@ def api_crypto_lag_variants():
                        AND ts >= ?""",
                     (v, cutoff_24h),
                 ).fetchone()["n"] or 0
+            except Exception:
+                pass
+        if has_state_table:
+            try:
+                row = d.conn.execute(
+                    """SELECT bankroll_usdc, realized_pnl_lifetime_usdc,
+                              gross_filled_lifetime_usdc, last_update_ts
+                       FROM crypto_lag_variant_state WHERE variant = ?""",
+                    (v,),
+                ).fetchone()
+                if row is not None:
+                    rec["bankroll_usdc"] = float(row["bankroll_usdc"])
+                    rec["realized_pnl_lifetime_usdc"] = float(row["realized_pnl_lifetime_usdc"])
+                    rec["gross_filled_lifetime_usdc"] = float(row["gross_filled_lifetime_usdc"])
+                    rec["bankroll_last_update_ts"] = float(row["last_update_ts"])
             except Exception:
                 pass
         out.append(rec)
