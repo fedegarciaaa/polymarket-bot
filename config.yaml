@@ -236,12 +236,16 @@ crypto_lag:
   # cancelaba a 0; el resultado fue $5,093 de gross filled en un solo cid.
   per_market_max_gross_usdc: 50
   # Cap de exposición simultánea (suma de |signed| en open positions +
-  # in-flight placements). Convierte "$1000 bankroll" en "nunca más de
-  # $200 comprometidos a la vez".
-  variant_max_committed_usdc: 200
-  # Tripwire de churn: si una variante coloca más de N órdenes por minuto,
-  # halt automático hasta el siguiente reset diario.
-  placements_per_minute_limit: 100
+  # in-flight placements). 50% del bankroll deja margen para que crezca
+  # naturalmente y sigue cortando runaway scenarios. El primer deploy con
+  # $200 (20%) auto-bloqueó la variante en 2 minutos al alcanzar 5 cids
+  # × $50 = $250, que ya superaba el cap; pasamos a $500.
+  variant_max_committed_usdc: 500
+  # Tripwire de churn. El comportamiento natural post-debounce (replace_th=2c,
+  # max_age=60s, min_interval=5s) emite ~100-150 placements/min con 30-40
+  # markets activos. 200/min deja headroom sin permitir las cascadas
+  # de 13k placements/h que se vieron antes del refactor.
+  placements_per_minute_limit: 200
   # Si bankroll cae bajo este suelo, halt definitivo de la variante.
   bankroll_floor_usdc: 100
   capital_pct: 0.30              # max % del bankroll que puede usar este módulo
