@@ -1185,7 +1185,12 @@ function clSetVariantTag(section, variant){
   if(!tag) return;
   tag.setAttribute('data-variant', variant);
   // Friendly labels
-  const labels = { main: 'estricto', permissive: 'permisivo (validación)' };
+  const labels = {
+    main: 'main (penny_aggressive)',
+    permissive: 'permissive (maker only)',
+    near_2h: 'near_2h (T<2h)',
+    near_30m: 'near_30m (T<30min)',
+  };
   tag.textContent = labels[variant] || variant;
 }
 
