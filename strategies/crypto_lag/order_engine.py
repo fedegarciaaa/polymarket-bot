@@ -192,7 +192,9 @@ class MakerOrderEngine:
         quote_mode: str = QUOTE_MODE_MAKER,
         cross_threshold_ticks: float = 4.0,
         placement_logger: Optional[Callable[[RestingOrder, float], None]] = None,
+        min_order_usdc: float = 5.0,
     ):
+        self.min_order_usdc = float(max(0.0, min_order_usdc))
         self.executor = executor
         self.risk = risk
         self.edge_threshold = edge_threshold_cents / 100.0
@@ -585,6 +587,15 @@ class MakerOrderEngine:
         now: float,
         is_taker: bool = False,
     ) -> None:
+        # LIVE-realism: Polymarket CLOB rejects orders below the per-market
+        # `orderMinSize` (typically $5). Skip silently — the model frequently
+        # produces tiny sizes when the bankroll cap is nearly full or Kelly
+        # output is small, and forwarding those to LIVE would just generate
+        # 4xx responses and rate-limit penalties.
+        min_order_usdc = float(getattr(self, "min_order_usdc", 5.0))
+        if size_usdc < min_order_usdc:
+            self.upsert_noop_period += 1
+            return
         cid = market.condition_id
         existing = self._open.setdefault(cid, {}).get(side)
         # Decide if we need to do anything

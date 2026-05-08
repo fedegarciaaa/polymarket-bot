@@ -241,11 +241,9 @@ crypto_lag:
   # $200 (20%) auto-bloqueó la variante en 2 minutos al alcanzar 5 cids
   # × $50 = $250, que ya superaba el cap; pasamos a $500.
   variant_max_committed_usdc: 500
-  # Tripwire de churn. El comportamiento natural post-debounce (replace_th=2c,
-  # max_age=60s, min_interval=5s) emite ~100-150 placements/min con 30-40
-  # markets activos. 200/min deja headroom sin permitir las cascadas
-  # de 13k placements/h que se vieron antes del refactor.
-  placements_per_minute_limit: 200
+  # LIVE-realism (2026-05-08): Polymarket CLOB rate limit es ~30 req/min.
+  # El simulador permitía 200/min, pero en LIVE eso causaría HTTP 429s.
+  placements_per_minute_limit: 30
   # Si bankroll cae bajo este suelo, halt definitivo de la variante.
   bankroll_floor_usdc: 100
   capital_pct: 0.30              # max % del bankroll que puede usar este módulo
@@ -277,6 +275,10 @@ crypto_lag:
     reconnect_max_seconds: 30
   refresh_seconds: 3             # cadencia del cycle async
   market_poll_seconds: 30        # cada cuánto refrescar lista de mercados activos
+  # LIVE-realism: Polymarket `orderMinSize` por market es típicamente $5.
+  # Órdenes < $5 se rechazan en LIVE; el simulator también las skipea para
+  # que las métricas reflejen el comportamiento real.
+  min_order_usdc: 5.0
   edge_threshold_cents: 2        # min edge (en cents de 0.01) para colocar maker
   # Fase 2 anti-churn: subido de 1c→2c. Antes cualquier desplazamiento de 1
   # tick disparaba cancel-and-replace; con tick=1c y mercados que se mueven
@@ -328,6 +330,11 @@ crypto_lag:
   paper:
     q_toxic: 0.30                # frac de fills que asumimos son adverse-selection
     queue_position_enabled: true # F0.2 — modelar cola realista
+    # LIVE-realism knobs (2026-05-08). El simulator estaba inflando PnL.
+    # Cambiar a false solo para replay histórico con la asunción anterior.
+    live_realistic_rebates: true   # Polymarket NO paga rebates (era +20% del fee)
+    taker_race_lost_pct: 0.25      # 25% de los IOC pierden la race en LIVE
+    q_toxic_extreme_scaling: true  # adverse selection sube en p<0.1, p>0.9
   circuit_breakers:
     daily_max_loss_usdc: 50
     consecutive_losses: 5

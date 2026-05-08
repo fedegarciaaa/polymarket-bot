@@ -153,6 +153,25 @@ class PaperExecutor:
         fee_rate: float = FEE_RATE_CRYPTO,
         maker_rebate_share: float = MAKER_REBATE_SHARE,
         queue_position_enabled: bool = True,
+        # ─── LIVE-realism knobs (added 2026-05-08) ──────────────────
+        # Polymarket CLOB does NOT pay maker rebates — the simulator was
+        # crediting 20% of the parabolic fee back to makers, which doesn't
+        # exist in LIVE. Set this true to zero out rebates and match
+        # production reality. The flag exists (instead of just hardcoding
+        # 0) so old runs can be replayed with the original assumption.
+        live_realistic_rebates: bool = True,
+        # Order race-loss probability for taker fills. In LIVE the bot's
+        # IOC order takes 100-300ms to reach the matching engine; in that
+        # window the book level can disappear (filled by someone else,
+        # cancelled by the maker, etc.). 0.25 = 25% of crossings turn
+        # into 0-fill cancels.
+        taker_race_lost_pct: float = 0.25,
+        # Adverse-selection scaling at extreme prices. base_q_toxic is
+        # used at p=0.5; as p approaches 0 or 1, q_toxic ramps up to
+        # base + (1-base) × extreme_factor where extreme_factor ∈ [0,1].
+        # extreme_factor = (1 - 4·p·(1-p))^2 — quadratic in distance
+        # from p=0.5. At p=0.10 that's ~0.4 → q_toxic ≈ 0.58 if base=0.30.
+        q_toxic_extreme_scaling: bool = True,
     ):
         self.clob_base = clob_base.rstrip("/")
         self.book_poll_seconds = book_poll_seconds
@@ -160,8 +179,13 @@ class PaperExecutor:
         self.adverse_haircut_pct = adverse_haircut_pct
         self._rng = random.Random(rng_seed)
         self.fee_rate = float(fee_rate)
-        self.maker_rebate_share = float(maker_rebate_share)
+        # Force rebate share to 0 in live-realistic mode — Polymarket
+        # CLOB doesn't pay makers; the previous +20% was simulator-only fiction.
+        self.maker_rebate_share = 0.0 if live_realistic_rebates else float(maker_rebate_share)
         self.queue_position_enabled = bool(queue_position_enabled)
+        self.live_realistic_rebates = bool(live_realistic_rebates)
+        self.taker_race_lost_pct = float(max(0.0, min(1.0, taker_race_lost_pct)))
+        self.q_toxic_extreme_scaling = bool(q_toxic_extreme_scaling)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._book_cache: dict[str, dict] = {}        # token_id → book
@@ -462,6 +486,21 @@ class PaperExecutor:
         # standing) — this means joining a thicker book penalizes us.
         self._queue_debt[order.order_id] = min(prev, new_debt)
 
+    def _effective_q_toxic(self, price: float) -> float:
+        """Scale q_toxic up at extreme prices.
+
+        Rationale: in LIVE, a counterparty willing to sell YES at $0.05 or
+        buy at $0.95 almost certainly has private information. Adverse
+        selection ramps up as p moves away from 0.5. The quadratic
+        `(1 - 4·p·(1-p))^2` gives 0 at p=0.5 and 1 at p∈{0,1}.
+        """
+        if not self.q_toxic_extreme_scaling:
+            return self.q_toxic
+        p = max(0.001, min(0.999, float(price)))
+        info_signal = (1.0 - 4.0 * p * (1.0 - p)) ** 2  # ∈ [0, 1]
+        # Blend: at p=0.5 → base; at extremes → base + (1 - base) × signal
+        return float(self.q_toxic + (1.0 - self.q_toxic) * info_signal)
+
     def _try_match(self, order: RestingOrder, book: dict) -> Optional[_FillEvent]:
         if order.side == "BUY":
             ask = book.get("best_ask")
@@ -477,7 +516,14 @@ class PaperExecutor:
             fill_size = min(remaining, ask_size_usdc)
             if fill_size <= 0:
                 return None
-            is_adverse = self._rng.random() < self.q_toxic
+            # LIVE latency: taker race may lose. The crossing was visible to
+            # us via REST polling (≥1.5s lag), but in LIVE our IOC order needs
+            # ~150ms to reach the matching engine. By that time the maker may
+            # have cancelled or another taker beat us.
+            if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
+                return None
+            q_tox = self._effective_q_toxic(order.price)
+            is_adverse = self._rng.random() < q_tox
             fill_price = order.price
             if is_adverse:
                 # Toxic taker — we get filled but the mark immediately moves
@@ -498,7 +544,11 @@ class PaperExecutor:
             fill_size = min(remaining, bid_size_usdc)
             if fill_size <= 0:
                 return None
-            is_adverse = self._rng.random() < self.q_toxic
+            # LIVE latency race (see BUY branch above).
+            if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
+                return None
+            q_tox = self._effective_q_toxic(order.price)
+            is_adverse = self._rng.random() < q_tox
             fill_price = order.price
             if is_adverse:
                 fill_price = order.price * (1.0 - self.adverse_haircut_pct)

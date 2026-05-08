@@ -231,6 +231,11 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             fee_rate=float(eff.get("fee_rate", FEE_RATE_CRYPTO)),
             maker_rebate_share=float(eff.get("maker_rebate_share", MAKER_REBATE_SHARE)),
             queue_position_enabled=bool(paper_cfg_v.get("queue_position_enabled", True)),
+            # LIVE-realism knobs (default: realistic). Tunable per variant via
+            # `paper.live_realistic_rebates / taker_race_lost_pct / q_toxic_extreme_scaling`.
+            live_realistic_rebates=bool(paper_cfg_v.get("live_realistic_rebates", True)),
+            taker_race_lost_pct=float(paper_cfg_v.get("taker_race_lost_pct", 0.25)),
+            q_toxic_extreme_scaling=bool(paper_cfg_v.get("q_toxic_extreme_scaling", True)),
         )
 
         # Per-variant bankroll: prefer the per-variant override, fall back to
@@ -286,6 +291,7 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             quote_mode=str(eff.get("quote_mode", "maker")),
             cross_threshold_ticks=float(eff.get("cross_threshold_ticks", 4.0)),
             placement_logger=placement_logger,
+            min_order_usdc=float(eff.get("min_order_usdc", 5.0)),
         )
         cycle = CryptoLagCycle(
             config=config, feed=feed, registry=registry, executor=executor,
