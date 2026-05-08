@@ -359,6 +359,43 @@ crypto_lag:
       cross_threshold_ticks: 2.0       # ticks adicionales para cruzar en libros 1c
       # paper.queue_position_enabled=true (default) → la cola sí cuenta
       # cuando hacemos penny-jump dentro del libro.
+    near_2h:
+      # NUEVO 2026-05-08: variante que solo opera markets cuya resolución
+      # está a menos de 2 horas. Hipótesis: el modelo BS-digital tiene
+      # poder predictivo real solo cuando T_remaining es pequeño (post-
+      # strike capture, o cerca). Las variantes main+permissive operan
+      # mayormente durante las 23h pre-strike donde prob_up≈0.50 y el
+      # edge es solo microestructura ruidosa. main lleva +$201 sobre
+      # 642 closes ≈ $0.31/trade — esencialmente coin-flip + tiny bias.
+      # Si esta variante consigue mejor avg_pnl/trade y win_rate >55%,
+      # confirma que la mayoría del edge está en las últimas horas y
+      # deberíamos restringir las otras variantes.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: penny_aggressive
+      edge_threshold_cents: 3              # más selectivo que main (2c)
+      cross_threshold_ticks: 2.0
+      max_seconds_to_resolution: 7200      # 2 horas
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.30
+    near_30m:
+      # NUEVO 2026-05-08: idéntica a near_2h pero ventana mucho más
+      # estrecha. En 30 min el strike capture (que ocurre 5 min antes
+      # de endDate) ya pasó o está muy cerca. Esto aísla el efecto del
+      # modelo BS-digital post-strike. Riesgo: pocos markets cumplirán
+      # el filtro a la vez → bankroll utilizado bajo. Si tras 24-48h
+      # tiene pocos closes (<20), el filtro es demasiado agresivo y
+      # ajustamos a 60 min.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: penny_aggressive
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 2.0
+      max_seconds_to_resolution: 1800      # 30 minutos
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.30
     permissive:
       # REACTIVADO 2026-05-08 con estrategia ORTOGONAL a main:
       #   - main:       penny_aggressive — post inside spread cuando se puede,

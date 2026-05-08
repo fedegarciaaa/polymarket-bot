@@ -88,6 +88,14 @@ class CryptoLagCycle:
         )
         self.max_book_spread = float(cfg.get("max_book_spread", 0.80))
         self.use_two_sided = bool(cfg.get("two_sided_quoting", True))
+        # Max seconds-to-resolution. Markets whose `endDate − now` exceeds
+        # this are skipped entirely (no quoting, no exposure tracked). 0 = no
+        # limit (legacy behaviour). Used by the `near_resolution` variants to
+        # restrict trading to the window where the BS-digital model has
+        # predictive power. Pre-strike (T_remaining ≈ 24h), prob_up converges
+        # to 0.50 regardless of spot, so the bot was effectively coin-flipping
+        # with a tiny microstructure bias — and accumulating overnight risk.
+        self.max_seconds_to_resolution = float(cfg.get("max_seconds_to_resolution", 0))
 
         # Volatility blend weights (realized vs IV vs GARCH). Defaults follow
         # the F1.1 plan: 0.5 realized, 0.3 IV, 0.2 GARCH.
@@ -208,6 +216,20 @@ class CryptoLagCycle:
     async def _handle_market(
         self, market: PolyCryptoMarket, feed_state, now: float, in_freeze: bool
     ) -> None:
+        # 2a-pre. Skip markets that resolve too far in the future. This is the
+        # "near_resolution" filter — when configured, the variant only enters
+        # markets whose endDate is within `max_seconds_to_resolution` from now.
+        # Skipping is silent (no gate count, no heartbeat) because these
+        # markets aren't even candidates for this variant.
+        if self.max_seconds_to_resolution > 0:
+            t_to_resolution = float(market.end_ts) - now
+            if t_to_resolution > self.max_seconds_to_resolution:
+                # Cancel any orders we might have left on this cid (shouldn't
+                # exist for this variant, but be defensive in case the
+                # threshold was lowered mid-run).
+                await self.engine.cancel_all_for(market.condition_id)
+                return
+
         # 2a. Per-market gate
         ok, reason = self.risk.can_quote_market(
             market.condition_id, feed_state, now, in_reconnect_freeze=in_freeze,
