@@ -335,6 +335,8 @@ crypto_lag:
     live_realistic_rebates: true   # Polymarket NO paga rebates (era +20% del fee)
     taker_race_lost_pct: 0.25      # 25% de los IOC pierden la race en LIVE
     q_toxic_extreme_scaling: true  # adverse selection sube en p<0.1, p>0.9
+    depth_haircut_enabled: true    # spoof / pulled liquidity en books thin
+                                   # (visible <$200=−50%, <$500=−35%, <$1k=−20%)
   circuit_breakers:
     daily_max_loss_usdc: 50
     consecutive_losses: 5

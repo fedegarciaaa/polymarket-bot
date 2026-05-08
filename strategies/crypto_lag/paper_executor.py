@@ -172,6 +172,16 @@ class PaperExecutor:
         # extreme_factor = (1 - 4·p·(1-p))^2 — quadratic in distance
         # from p=0.5. At p=0.10 that's ~0.4 → q_toxic ≈ 0.58 if base=0.30.
         q_toxic_extreme_scaling: bool = True,
+        # Depth haircut for thin books. In LIVE, the visible size at the
+        # best level is partially "spoof" (cancelled before our IOC lands)
+        # in markets with low overall liquidity. The haircut applies a
+        # discount to the visible USDC at the matching level so we fill
+        # less than the simulator would otherwise allow. Empirically:
+        #   visible < $200  → 50% haircut (very thin / spoofy)
+        #   visible < $500  → 35% haircut
+        #   visible < $1000 → 20% haircut
+        #   visible ≥ $1000 → 0%
+        depth_haircut_enabled: bool = True,
     ):
         self.clob_base = clob_base.rstrip("/")
         self.book_poll_seconds = book_poll_seconds
@@ -186,6 +196,7 @@ class PaperExecutor:
         self.live_realistic_rebates = bool(live_realistic_rebates)
         self.taker_race_lost_pct = float(max(0.0, min(1.0, taker_race_lost_pct)))
         self.q_toxic_extreme_scaling = bool(q_toxic_extreme_scaling)
+        self.depth_haircut_enabled = bool(depth_haircut_enabled)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._book_cache: dict[str, dict] = {}        # token_id → book
@@ -486,6 +497,23 @@ class PaperExecutor:
         # standing) — this means joining a thicker book penalizes us.
         self._queue_debt[order.order_id] = min(prev, new_debt)
 
+    def _depth_multiplier(self, visible_size_usdc: float) -> float:
+        """Return a multiplier ∈ [0.5, 1.0] applied to visible book depth to
+        emulate spoof / pulled liquidity in LIVE. Thinner books → bigger
+        haircut. Tuned to be conservative: real spoof rate in low-liquidity
+        Polymarket crypto books has been observed at 30-50% in audits.
+        """
+        if not self.depth_haircut_enabled:
+            return 1.0
+        v = float(visible_size_usdc or 0.0)
+        if v < 200.0:
+            return 0.50
+        if v < 500.0:
+            return 0.65
+        if v < 1000.0:
+            return 0.80
+        return 1.0
+
     def _effective_q_toxic(self, price: float) -> float:
         """Scale q_toxic up at extreme prices.
 
@@ -512,6 +540,9 @@ class PaperExecutor:
             debt = self._queue_debt.get(order.order_id, 0.0)
             if self.queue_position_enabled and debt > 0:
                 return None
+            # LIVE-realism: the visible ask size is partially spoof in thin
+            # books. Discount before computing fill size.
+            ask_size_usdc *= self._depth_multiplier(ask_size_usdc)
             remaining = max(0.0, order.size_usdc - order.filled_size_usdc)
             fill_size = min(remaining, ask_size_usdc)
             if fill_size <= 0:
@@ -540,6 +571,8 @@ class PaperExecutor:
             debt = self._queue_debt.get(order.order_id, 0.0)
             if self.queue_position_enabled and debt > 0:
                 return None
+            # Same depth haircut on the SELL side for symmetry.
+            bid_size_usdc *= self._depth_multiplier(bid_size_usdc)
             remaining = max(0.0, order.size_usdc - order.filled_size_usdc)
             fill_size = min(remaining, bid_size_usdc)
             if fill_size <= 0:
