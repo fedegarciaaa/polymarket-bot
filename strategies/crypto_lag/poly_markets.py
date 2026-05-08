@@ -248,13 +248,21 @@ class CryptoMarketRegistry:
         #   - resolving: order=endDate asc    → markets about to resolve
         #                (T_remaining ≈ 0..2h, where BS-digital actually
         #                has predictive power)
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         params_newest = {
             "limit": 200, "active": "true", "closed": "false",
             "order": "startDate", "ascending": "false",
         }
+        # `end_date_min=now` is essential — without it Gamma returns zombie
+        # markets (political/sports markets stuck at active=true years after
+        # their endDate). limit=500 because the first ~200 results are
+        # weather/political markets resolving in the same minute as the
+        # crypto ones; crypto-updown only become visible past row ~250.
         params_resolving = {
-            "limit": 200, "active": "true", "closed": "false",
+            "limit": 500, "active": "true", "closed": "false",
             "order": "endDate", "ascending": "true",
+            "end_date_min": now_iso,
         }
         data: list = []
         seen_ids: set = set()
