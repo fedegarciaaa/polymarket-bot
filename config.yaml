@@ -360,18 +360,23 @@ crypto_lag:
       # paper.queue_position_enabled=true (default) → la cola sí cuenta
       # cuando hacemos penny-jump dentro del libro.
     permissive:
-      # APAGADO 2026-05-07: tras 48h de paper trading acumuló −$19,714 con
-      # $26k de fees pagados sobre $1.46M de gross filled. Win rate 50.2%
-      # × edge bruto 4 ticks no cubre la parabolic fee de Polymarket
-      # (~7.2% peak en p=0.5). El problema es estructural del modo taker
-      # puro a estos thresholds, no de tuning. Reactivable tras Fase 3
-      # con edge_threshold_cents ≥ 8 si los datos lo justifican.
-      enabled: false
-      bankroll_usdc: 1000.0            # ignorado mientras enabled=false
-      quote_mode: ioc_taker
-      edge_threshold_cents: 4          # gross edge mínimo (sin rebate, pagamos fee)
-      cross_threshold_ticks: 4.0       # 4c → ~doble de la fee típica en p=0.5
+      # REACTIVADO 2026-05-08 con estrategia ORTOGONAL a main:
+      #   - main:       penny_aggressive — post inside spread cuando se puede,
+      #                 cruza con IOC cuando spread=1c. Termina cruzando >90%.
+      #   - permissive: maker (post-only puro) — NUNCA cruza. Edge mínimo
+      #                 más estricto (3c) para que solo poste cuando hay
+      #                 holgura clara. Tests si el rebate maker (que en main
+      #                 nunca se materializa porque siempre termina cruzando)
+      #                 puede ser una vía rentable distinta.
+      # Si esta variante consigue >50 maker fills en 24h con rebate>fees
+      # acumulado, demuestra que sí hay edge maker y aplicaríamos los
+      # aprendizajes a main. Si tras 48h tiene 0 fills (cola siempre rota
+      # antes), confirma que penny_aggressive era la única vía y reverte.
+      enabled: true
+      bankroll_usdc: 1000.0            # bankroll independiente de main
+      quote_mode: maker                # POST-ONLY puro, nunca cruza
+      edge_threshold_cents: 3          # más estricto que main (que es 2c)
+      cross_threshold_ticks: 999.0     # nunca cruzar (efectivamente off)
       paper:
-        queue_position_enabled: false  # IOC nunca tiene cola
-        q_toxic: 0.30                  # mantener q_toxic alto: cruzar el libro
-                                       # captura más adverse selection real
+        queue_position_enabled: true   # cola SÍ cuenta en maker
+        q_toxic: 0.20                  # algo menos adverse que main (no cruzamos)

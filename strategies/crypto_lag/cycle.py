@@ -129,6 +129,15 @@ class CryptoLagCycle:
         self._rebates_period: float = 0.0
         self._closes_period: int = 0
 
+        # Watchdog: if no placement happens for N seconds despite the cycle
+        # still running, log an INFO line every N seconds with the current
+        # gate counts so we can diagnose silent stalls. The 18.5h overnight
+        # stall on 2026-05-07 left zero log evidence — `globally-gated` and
+        # `gated {market}` were both DEBUG-level, invisible in journalctl.
+        self._watchdog_quiet_threshold_s: float = 1800.0  # 30 min
+        self._watchdog_last_log_ts: float = 0.0
+        self._gate_reason_counts: dict[str, int] = {}
+
     async def run_forever(self) -> None:
         logger.info("crypto_lag cycle started")
         try:
@@ -168,7 +177,9 @@ class CryptoLagCycle:
             # Still process fills/resolutions even if we don't open new orders
             await self._process_fills_and_resolutions(now)
             if reason != "ok":
+                self._gate_reason_counts[reason] = self._gate_reason_counts.get(reason, 0) + 1
                 logger.debug(f"globally-gated: {reason}")
+            self._maybe_emit_watchdog(now)
             return
 
         in_freeze = self.feed.is_in_reconnect_freeze(now)
@@ -191,6 +202,8 @@ class CryptoLagCycle:
 
         # 2. Drain fills and resolutions
         await self._process_fills_and_resolutions(now)
+        # 3. Watchdog: emit visibility if the cycle is alive but quiet.
+        self._maybe_emit_watchdog(now)
 
     async def _handle_market(
         self, market: PolyCryptoMarket, feed_state, now: float, in_freeze: bool
@@ -200,6 +213,11 @@ class CryptoLagCycle:
             market.condition_id, feed_state, now, in_reconnect_freeze=in_freeze,
         )
         if not ok:
+            # Track gate-reason counts for the watchdog (visibility into silent stalls).
+            # Bucket reasons by their key prefix (e.g. "feed_stale:1.2s" → "feed_stale")
+            # so different param values for the same gate aggregate into one count.
+            r_key = reason.split(":", 1)[0] if ":" in reason else reason
+            self._gate_reason_counts[r_key] = self._gate_reason_counts.get(r_key, 0) + 1
             logger.debug(f"gated {market.symbol} {market.market_slug[:30]}: {reason}")
             await self.engine.cancel_all_for(market.condition_id)
             self._heartbeat_snapshot(market, feed_state, now, decision="GATED")
@@ -807,10 +825,64 @@ class CryptoLagCycle:
         self._gross_pnl_period = 0.0
         self._fees_period = 0.0
         self._rebates_period = 0.0
+        # Reset gate counters so the watchdog reports the next window.
+        self._gate_reason_counts.clear()
         try:
             self.engine.reset_period_counters()
         except Exception:
             pass
+
+    def _maybe_emit_watchdog(self, now: float) -> None:
+        """Emit an INFO log when the cycle has been alive but quiet for too long.
+
+        The 2026-05-07 overnight stall left zero log evidence — both
+        `globally-gated` and per-market `gated` lines are DEBUG-level so they
+        don't reach journalctl by default. After 30 min of no placements,
+        this method dumps a one-shot summary (top gate reasons + risk state)
+        every 30 min so an operator can see WHY the cycle is silent without
+        having to attach a debugger.
+
+        Cheap: dict snapshot + a single log line. No-op when active.
+        """
+        last_pl = float(getattr(self.engine, "_last_placement_ts", 0.0) or 0.0)
+        if last_pl <= 0:
+            # Use cycle start as a fallback so we still log if the bot has
+            # never placed anything since boot.
+            last_pl = self._stats_period_start
+        quiet_age = now - last_pl
+        if quiet_age < self._watchdog_quiet_threshold_s:
+            return
+        # Throttle: emit once per `_watchdog_quiet_threshold_s` window.
+        if (now - self._watchdog_last_log_ts) < self._watchdog_quiet_threshold_s:
+            return
+        self._watchdog_last_log_ts = now
+        # Top 5 gate reasons by count (descending)
+        top_gates = sorted(
+            self._gate_reason_counts.items(), key=lambda kv: kv[1], reverse=True
+        )[:5]
+        gates_str = ", ".join(f"{k}={v}" for k, v in top_gates) if top_gates else "none"
+        # Risk snapshot for committed/bankroll visibility
+        try:
+            snap = self.risk.snapshot()
+            risk_str = (
+                f"BK=${snap.get('bankroll_usdc', 0):.0f} "
+                f"committed=${snap.get('committed_now_usdc', 0):.0f} "
+                f"avail=${snap.get('available_committed_usdc', 0):.0f} "
+                f"open_markets={snap.get('open_markets', 0)}"
+            )
+        except Exception:
+            risk_str = "(no snapshot)"
+        # _positions count from the executor (tells us if there are positions
+        # the resolver is supposed to be processing).
+        pos_count = -1
+        try:
+            pos_count = len(getattr(self.executor, "_positions", {}))
+        except Exception:
+            pass
+        logger.info(
+            f"WATCHDOG [{self.variant}]: quiet for {quiet_age/60:.1f}min. "
+            f"gates({gates_str}). {risk_str}. positions_open={pos_count}"
+        )
 
 
 def _book_imbalance(bid_size: float, ask_size: float) -> float:

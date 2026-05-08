@@ -242,6 +242,9 @@ class MakerOrderEngine:
         self.placements_period: int = 0
         self.placements_period_taker: int = 0
         self.placements_lifetime: int = 0
+        # Read by the cycle watchdog. Updated on every successful placement
+        # so a stalled cycle can be detected via "now - _last_placement_ts".
+        self._last_placement_ts: float = 0.0
         # Fase 2: track noop vs actual-replace decisions in `_upsert` so the
         # hourly stats can show the churn ratio (high noop = healthy).
         self.upsert_noop_period: int = 0
@@ -643,6 +646,7 @@ class MakerOrderEngine:
             taker_tag = " TAKER" if is_taker else ""
             self.placements_period += 1
             self.placements_lifetime += 1
+            self._last_placement_ts = now
             if is_taker:
                 self.placements_period_taker += 1
             logger.info(
