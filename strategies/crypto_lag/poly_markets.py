@@ -232,21 +232,48 @@ class CryptoMarketRegistry:
         logger.info("market registry stopped")
 
     async def _refresh(self, session: aiohttp.ClientSession) -> None:
-        # We pull the most recently created markets sorted by startDate desc.
-        # Up/down 15m markets have lifetimes of ~16 minutes, so a 200-row
-        # window is plenty.
-        params = {
-            "limit": 200,
-            "active": "true",
-            "closed": "false",
-            "order": "startDate",
-            "ascending": "false",
+        # Polymarket Up/Down crypto markets have a ~24h trading window
+        # (startDate to endDate). Polymarket creates ~15 new markets per
+        # 5-min slot per symbol/horizon, so at any given moment there are
+        # 5,000+ active markets in the API. A single 200-row query sorted
+        # by `startDate desc` only captures the ~3-4 minutes of newest
+        # markets (T_remaining ≈ 24h), missing all the markets that are
+        # actually close to resolution. That made the `near_2h` /
+        # `near_30m` variants invisible to any market in their window —
+        # and meant the bot was operating only the 50/50 pre-strike zone.
+        #
+        # Fix: do TWO queries and union the results.
+        #   - newest:    order=startDate desc → freshly opened markets
+        #                (T_remaining ≈ 24h, what main was already seeing)
+        #   - resolving: order=endDate asc    → markets about to resolve
+        #                (T_remaining ≈ 0..2h, where BS-digital actually
+        #                has predictive power)
+        params_newest = {
+            "limit": 200, "active": "true", "closed": "false",
+            "order": "startDate", "ascending": "false",
         }
-        async with session.get(self.GAMMA_URL, params=params, timeout=15) as r:
-            if r.status != 200:
-                logger.warning(f"gamma {r.status}")
-                return
-            data = await r.json()
+        params_resolving = {
+            "limit": 200, "active": "true", "closed": "false",
+            "order": "endDate", "ascending": "true",
+        }
+        data: list = []
+        seen_ids: set = set()
+        for label, params in (("newest", params_newest), ("resolving", params_resolving)):
+            try:
+                async with session.get(self.GAMMA_URL, params=params, timeout=15) as r:
+                    if r.status != 200:
+                        logger.warning(f"gamma ({label}) {r.status}")
+                        continue
+                    rows = await r.json()
+            except Exception as exc:
+                logger.warning(f"gamma ({label}) request failed: {exc}")
+                continue
+            for raw in rows or []:
+                cid = raw.get("conditionId") or raw.get("condition_id")
+                if not cid or cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                data.append(raw)
 
         new_records: dict[str, _MarketInternal] = {}
         skipped_liquidity = 0
