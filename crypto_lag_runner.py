@@ -237,6 +237,8 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             taker_race_lost_pct=float(paper_cfg_v.get("taker_race_lost_pct", 0.25)),
             q_toxic_extreme_scaling=bool(paper_cfg_v.get("q_toxic_extreme_scaling", True)),
             depth_haircut_enabled=bool(paper_cfg_v.get("depth_haircut_enabled", True)),
+            maker_race_lost_pct=float(paper_cfg_v.get("maker_race_lost_pct", 0.15)),
+            queue_advance_credit_pct=float(paper_cfg_v.get("queue_advance_credit_pct", 0.50)),
         )
 
         # Per-variant bankroll: prefer the per-variant override, fall back to

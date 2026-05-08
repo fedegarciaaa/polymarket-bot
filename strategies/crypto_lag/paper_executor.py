@@ -182,6 +182,20 @@ class PaperExecutor:
         #   visible < $1000 → 20% haircut
         #   visible ≥ $1000 → 0%
         depth_haircut_enabled: bool = True,
+        # Maker race-lost: when the book crosses into our resting maker,
+        # in LIVE we sometimes lose the fill to a competitor maker who
+        # posted at the same price milliseconds earlier (FIFO priority)
+        # or to a faster IOC that hit before us. Higher in thin books
+        # where queue jostling is dominated by a few players.
+        maker_race_lost_pct: float = 0.15,
+        # Queue advancement haircut: in LIVE, when visible size at our
+        # level drops, ~50% of those size reductions are cancellations
+        # (which do NOT advance us in the FIFO queue) while ~50% are
+        # actual fills (which do). The simulator pre-fix advanced us
+        # for 100% of reductions — too generous. With this factor, only
+        # `queue_advance_credit_pct` of the observed shrinkage counts
+        # toward decreasing our queue debt.
+        queue_advance_credit_pct: float = 0.50,
     ):
         self.clob_base = clob_base.rstrip("/")
         self.book_poll_seconds = book_poll_seconds
@@ -197,6 +211,8 @@ class PaperExecutor:
         self.taker_race_lost_pct = float(max(0.0, min(1.0, taker_race_lost_pct)))
         self.q_toxic_extreme_scaling = bool(q_toxic_extreme_scaling)
         self.depth_haircut_enabled = bool(depth_haircut_enabled)
+        self.maker_race_lost_pct = float(max(0.0, min(1.0, maker_race_lost_pct)))
+        self.queue_advance_credit_pct = float(max(0.0, min(1.0, queue_advance_credit_pct)))
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._book_cache: dict[str, dict] = {}        # token_id → book
@@ -483,14 +499,29 @@ class PaperExecutor:
         """Each poll, decrement our queue debt by however much the visible
         depth at our level shrank since the last snapshot. This is a
         conservative proxy for "the queue moved" without access to a true
-        delta feed."""
+        delta feed.
+
+        LIVE-realism: visible-depth shrinkage is NOT 100% fills. A large
+        fraction is cancellations, which do NOT advance us in the FIFO queue
+        (the cancelled order never occupied our slot). We credit only
+        `queue_advance_credit_pct` of observed shrinkage. Empirically in
+        Polymarket crypto books, ~50% of shrinkage events are cancels in
+        thin / volatile markets.
+        """
         if not self.queue_position_enabled:
             self._queue_debt[order.order_id] = 0.0
             return
         prev = self._queue_debt.get(order.order_id, 0.0)
         if prev <= 0.0:
             return
-        new_debt = self._compute_queue_debt(order, book)
+        new_debt_raw = self._compute_queue_debt(order, book)
+        if new_debt_raw < prev:
+            # Only credit a fraction of the apparent advancement.
+            shrinkage = prev - new_debt_raw
+            credited_shrinkage = shrinkage * self.queue_advance_credit_pct
+            new_debt = prev - credited_shrinkage
+        else:
+            new_debt = new_debt_raw
         # Debt only ever monotonically decreases until we cancel/replace; if
         # the book grew (someone else joined behind us, or above our level)
         # we conservatively reset to the new value (it reflects current
@@ -553,6 +584,12 @@ class PaperExecutor:
             # have cancelled or another taker beat us.
             if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
                 return None
+            # LIVE maker race-lost: when the book crosses into a resting
+            # maker, FIFO priority can put us behind a competitor maker that
+            # joined microseconds earlier, or a fast IOC can hit ahead of us.
+            # Empirically 15% in thin Polymarket books.
+            if (not order.is_taker) and self._rng.random() < self.maker_race_lost_pct:
+                return None
             q_tox = self._effective_q_toxic(order.price)
             is_adverse = self._rng.random() < q_tox
             fill_price = order.price
@@ -579,6 +616,8 @@ class PaperExecutor:
                 return None
             # LIVE latency race (see BUY branch above).
             if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
+                return None
+            if (not order.is_taker) and self._rng.random() < self.maker_race_lost_pct:
                 return None
             q_tox = self._effective_q_toxic(order.price)
             is_adverse = self._rng.random() < q_tox

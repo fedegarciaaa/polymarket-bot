@@ -337,6 +337,13 @@ crypto_lag:
     q_toxic_extreme_scaling: true  # adverse selection sube en p<0.1, p>0.9
     depth_haircut_enabled: true    # spoof / pulled liquidity en books thin
                                    # (visible <$200=−50%, <$500=−35%, <$1k=−20%)
+    # Permissive-specific frictions (afectan también a main/near_* en sus
+    # ramas maker, pero son mucho más impactantes para permissive que es 100% maker):
+    maker_race_lost_pct: 0.15      # 15% de crosses-into-us se pierden por
+                                   # FIFO con otro maker / IOC más rápido
+    queue_advance_credit_pct: 0.50 # solo 50% de la reducción de visible_size
+                                   # cuenta como avance real en cola (resto
+                                   # son cancels que no avanzan tu posición)
   circuit_breakers:
     daily_max_loss_usdc: 50
     consecutive_losses: 5
