@@ -11,7 +11,12 @@ bot:
   max_concurrent_positions: 3
   demo_capital: 1000.0
   max_trades_per_cycle: 2
-  reset_on_start: true        # borra trades/ciclos/skips/events antes de arrancar
+  reset_on_start: false       # MANTENER bankroll persistido de permissive
+                              # ($1377 acumulado en 4h LIVE-realistic)
+                              # las 3 nuevas variantes (maker_wide_spread,
+                              # maker_near_2h, maker_near_30m) NO tienen
+                              # estado persistido → arrancan con bankroll
+                              # default 1000 según config
   keep_last_n_runs: 3         # archivos comprimidos en logs/archive/
   reset_rules: false          # mantener learned_rules entre runs por defecto
 
@@ -369,49 +374,90 @@ crypto_lag:
   # vs 'filled', is_taker, fee/rebate, queue_debt) para comparativa directa.
   variants:
     main:
-      bankroll_usdc: 1000.0            # bankroll per variant ($1000)
-      quote_mode: penny_aggressive
-      edge_threshold_cents: 2          # min net edge para cualquier post
-      cross_threshold_ticks: 2.0       # ticks adicionales para cruzar en libros 1c
-      # paper.queue_position_enabled=true (default) → la cola sí cuenta
-      # cuando hacemos penny-jump dentro del libro.
-    near_2h:
-      # NUEVO 2026-05-08: variante que solo opera markets cuya resolución
-      # está a menos de 2 horas. Hipótesis: el modelo BS-digital tiene
-      # poder predictivo real solo cuando T_remaining es pequeño (post-
-      # strike capture, o cerca). Las variantes main+permissive operan
-      # mayormente durante las 23h pre-strike donde prob_up≈0.50 y el
-      # edge es solo microestructura ruidosa. main lleva +$201 sobre
-      # 642 closes ≈ $0.31/trade — esencialmente coin-flip + tiny bias.
-      # Si esta variante consigue mejor avg_pnl/trade y win_rate >55%,
-      # confirma que la mayoría del edge está en las últimas horas y
-      # deberíamos restringir las otras variantes.
-      enabled: true
+      # APAGADO 2026-05-08 tras 4h de paper en LIVE-realistic mode:
+      # 11 closes / 1 win (9% WR), -$220 PnL, -23% bankroll. El cruce
+      # del book era la causa estructural — race-lost + adverse en
+      # precios extremos + fees > edge directional del modelo BS sobre
+      # microestructura instantánea. Reemplazado por maker_wide_spread
+      # (maker-only, solo books con spread genuino).
+      enabled: false
       bankroll_usdc: 1000.0
       quote_mode: penny_aggressive
-      edge_threshold_cents: 3              # más selectivo que main (2c)
+      edge_threshold_cents: 2
       cross_threshold_ticks: 2.0
-      max_seconds_to_resolution: 7200      # 2 horas
+    maker_wide_spread:
+      # NUEVO 2026-05-08: reemplaza a main. Maker-only puro como
+      # permissive, pero SOLO opera markets cuyo book spread visible
+      # sea ≥3 ticks. La hipótesis: en books de 1 tick (que es el caso
+      # mayoritario en crypto markets activos), no hay realmente spread
+      # que capturar. Solo books con spread genuino dejan room para
+      # penny-jump real con cushion.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0     # nunca cruzar
+      min_book_spread_ticks: 3.0       # solo books con spread ≥3 ticks
       paper:
         queue_position_enabled: true
-        q_toxic: 0.30
-    near_30m:
-      # NUEVO 2026-05-08: idéntica a near_2h pero ventana mucho más
-      # estrecha. En 30 min el strike capture (que ocurre 5 min antes
-      # de endDate) ya pasó o está muy cerca. Esto aísla el efecto del
-      # modelo BS-digital post-strike. Riesgo: pocos markets cumplirán
-      # el filtro a la vez → bankroll utilizado bajo. Si tras 24-48h
-      # tiene pocos closes (<20), el filtro es demasiado agresivo y
-      # ajustamos a 60 min.
-      enabled: true
+        q_toxic: 0.20
+    near_2h:
+      # APAGADO 2026-05-08: penny_aggressive con filtro T<2h también
+      # cruzaba el book mayormente. 12 closes / 1 win (8% WR), -$368
+      # PnL, -49% bankroll en 4h. Misma causa estructural que main —
+      # el cross del libro es perdedor en LIVE-realistic. Reemplazado
+      # por maker_near_2h.
+      enabled: false
       bankroll_usdc: 1000.0
       quote_mode: penny_aggressive
       edge_threshold_cents: 3
       cross_threshold_ticks: 2.0
-      max_seconds_to_resolution: 1800      # 30 minutos
+      max_seconds_to_resolution: 7200
+    maker_near_2h:
+      # NUEVO 2026-05-08: reemplaza a near_2h. Combina maker-only
+      # (como permissive) + filtro T<2h (como near_2h). La hipótesis
+      # es que combinar spread capture maker con la ventana donde el
+      # modelo BS tiene info útil para POSTAR (no para cruzar) puede
+      # mejorar el ratio de permissive solo. Postear in la zona right
+      # del strike sería más selectivo y de mayor edge.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0     # nunca cruzar
+      max_seconds_to_resolution: 7200  # 2 horas
       paper:
         queue_position_enabled: true
-        q_toxic: 0.30
+        q_toxic: 0.20
+    near_30m:
+      # APAGADO 2026-05-08: penny_aggressive con filtro T<30min
+      # bajó a -$452 en 4h, 24% WR. Mismo problema estructural —
+      # el modo cross del book es perdedor. Reemplazado por
+      # maker_near_30m.
+      enabled: false
+      bankroll_usdc: 1000.0
+      quote_mode: penny_aggressive
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 2.0
+      max_seconds_to_resolution: 1800
+    maker_near_30m:
+      # NUEVO 2026-05-08: reemplaza a near_30m. Maker-only con
+      # filtro T<30min. El experimento más agresivo: la ventana
+      # más estrecha donde el strike ya está fijado o muy próximo,
+      # combinado con maker-only para evitar todas las frictions
+      # de cruzar. Si esta variante supera a permissive solo, valida
+      # que postear en la zona right-of-strike es donde está el
+      # mayor edge. Riesgo: pocos markets en su window → bankroll
+      # utilizado bajo. Si tras 24-48h tiene pocos closes, ajustamos.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0
+      max_seconds_to_resolution: 1800  # 30 minutos
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.20
     permissive:
       # REACTIVADO 2026-05-08 con estrategia ORTOGONAL a main:
       #   - main:       penny_aggressive — post inside spread cuando se puede,

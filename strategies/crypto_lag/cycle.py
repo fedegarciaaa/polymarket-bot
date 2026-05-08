@@ -96,6 +96,13 @@ class CryptoLagCycle:
         # to 0.50 regardless of spot, so the bot was effectively coin-flipping
         # with a tiny microstructure bias — and accumulating overnight risk.
         self.max_seconds_to_resolution = float(cfg.get("max_seconds_to_resolution", 0))
+        # Minimum book spread (in ticks) required to even attempt to quote
+        # this market. 0 = no requirement. Used by the maker_wide_spread
+        # variant: when the visible spread is only 1 tick, there's no real
+        # spread to capture as maker (penny-jumps land on top of book without
+        # cushion); requiring spread ≥ 3 ticks ensures genuine spread capture
+        # opportunities.
+        self.min_book_spread_ticks = float(cfg.get("min_book_spread_ticks", 0))
 
         # Volatility blend weights (realized vs IV vs GARCH). Defaults follow
         # the F1.1 plan: 0.5 realized, 0.3 IV, 0.2 GARCH.
@@ -290,6 +297,18 @@ class CryptoLagCycle:
             await self.engine.cancel_all_for(market.condition_id)
             self._heartbeat_snapshot(market, feed_state, now, decision="NO_BOOK", sigma=sigma)
             return
+
+        # Minimum spread filter — only operate when there's enough spread
+        # to capture as a maker. With tick=$0.01 in most markets, a 1-tick
+        # spread leaves no room to penny-jump or capture spread; markets
+        # in this state are essentially saturated.
+        if self.min_book_spread_ticks > 0:
+            min_spread_usd = self.min_book_spread_ticks * float(market.tick_size or 0.01)
+            if (poly_ask - poly_bid) < min_spread_usd - 1e-9:
+                await self.engine.cancel_all_for(market.condition_id)
+                # Silent skip — no heartbeat to avoid flooding (this can
+                # filter most markets when spread is typically 1 tick).
+                return
 
         # 2e. Polymarket-side OBI (own-book imbalance, separate from Binance).
         poly_obi = _book_imbalance(book.get("bid_size", 0.0), book.get("ask_size", 0.0))
