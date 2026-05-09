@@ -799,6 +799,17 @@ class CryptoLagCycle:
         upsert_noop = int(getattr(self.engine, "upsert_noop_period", 0) or 0)
         upsert_replace = int(getattr(self.engine, "upsert_replace_period", 0) or 0)
         upsert_debounce = int(getattr(self.engine, "upsert_debounce_period", 0) or 0)
+        # F7 — fidelity-fix counters. Lifetime totals (not period) so the
+        # dashboard shows whether F1-F5 are firing at the expected rate.
+        # We snapshot all four paper-side counters and the F5 engine counter.
+        ex = getattr(self, "executor", None)
+        adverse_size_truncated = int(getattr(ex, "adverse_size_truncated_count", 0) or 0)
+        extreme_race_lost = int(getattr(ex, "extreme_race_lost_count", 0) or 0)
+        extreme_q_toxic_capped = int(getattr(ex, "extreme_q_toxic_capped_count", 0) or 0)
+        depth_extreme_haircut = int(getattr(ex, "depth_extreme_haircut_count", 0) or 0)
+        extreme_price_blocked = int(
+            getattr(self.engine, "extreme_price_blocked_period", 0) or 0
+        )
         fills = self._fills_period
         closes = self._closes_period
         gross_pnl = round(self._gross_pnl_period, 4)
@@ -840,6 +851,14 @@ class CryptoLagCycle:
                     "upsert_noop": upsert_noop,
                     "upsert_replace": upsert_replace,
                     "upsert_debounce": upsert_debounce,
+                    # F7 — fidelity-fix counters (lifetime). Watch
+                    # extreme_price_blocked and adverse_size_truncated
+                    # ramp up after the post-audit fixes go live.
+                    "adverse_size_truncated_lifetime": adverse_size_truncated,
+                    "extreme_race_lost_lifetime": extreme_race_lost,
+                    "extreme_q_toxic_capped_lifetime": extreme_q_toxic_capped,
+                    "depth_extreme_haircut_lifetime": depth_extreme_haircut,
+                    "extreme_price_blocked_period": extreme_price_blocked,
                 },
             )
         except Exception as exc:

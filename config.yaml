@@ -420,7 +420,11 @@ crypto_lag:
       # modelo BS tiene info útil para POSTAR (no para cruzar) puede
       # mejorar el ratio de permissive solo. Postear in la zona right
       # del strike sería más selectivo y de mayor edge.
-      enabled: true
+      # APAGADO 2026-05-09 (F6 del plan post-audit): reducimos a
+      # 2 cohortes (maker_wide_spread + maker_focused) para juzgar el
+      # efecto de F1-F5 con menos varianza inter-variant. Re-encender
+      # tras 48-72h de paper post-fixes.
+      enabled: false
       bankroll_usdc: 1000.0
       quote_mode: maker
       edge_threshold_cents: 3
@@ -449,7 +453,9 @@ crypto_lag:
       # que postear en la zona right-of-strike es donde está el
       # mayor edge. Riesgo: pocos markets en su window → bankroll
       # utilizado bajo. Si tras 24-48h tiene pocos closes, ajustamos.
-      enabled: true
+      # APAGADO 2026-05-09 (F6 del plan post-audit): ver comentario
+      # en maker_near_2h.
+      enabled: false
       bankroll_usdc: 1000.0
       quote_mode: maker
       edge_threshold_cents: 3
@@ -485,7 +491,9 @@ crypto_lag:
       # Hipótesis: si funciona similar a maker_wide_spread (que tiene
       # filtro de spread, no temporal), tenemos 4 estrategias maker
       # con orthogonal filters y todas rentables.
-      enabled: true
+      # APAGADO 2026-05-09 (F6 del plan post-audit): ver comentario
+      # en maker_near_2h.
+      enabled: false
       bankroll_usdc: 1000.0
       quote_mode: maker
       edge_threshold_cents: 3

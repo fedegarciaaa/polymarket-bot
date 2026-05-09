@@ -196,6 +196,33 @@ class PaperExecutor:
         # `queue_advance_credit_pct` of the observed shrinkage counts
         # toward decreasing our queue debt.
         queue_advance_credit_pct: float = 0.50,
+        # F1 — adverse-fill size attenuation. When the toxicity coin flip
+        # marks a fill as adverse, the simulator pre-fix only nudged
+        # fill_price by `adverse_haircut_pct`. In LIVE an informed
+        # counterparty almost always reduces SIZE (or cancels) rather than
+        # giving us full notional at a slightly worse mark. The fill_size
+        # is multiplied by `(1 - q_tox * adverse_size_attenuation)`, with a
+        # floor at `min_fill_usdc` below which the match is treated as a
+        # cancel. attenuation=1.0 + q_tox=0.7 → 70% size cut, which matches
+        # Glosten-Milgrom adverse-selection magnitudes for binary markets.
+        adverse_size_attenuation: float = 1.0,
+        min_fill_usdc: float = 0.50,
+        # F2 — extreme-price race-lost scaling. The same quadratic shape
+        # used by `_effective_q_toxic` ramps `maker_race_lost_pct` from its
+        # base value at p=0.5 up to `maker_race_lost_max` at p∈{0,1}.
+        # Captures the empirical observation that FIFO competition in tail
+        # quotes is dominated by a few informed market makers.
+        maker_race_lost_max: float = 0.65,
+        # F3 — absolute cap on `_effective_q_toxic`. Without it, q_tox can
+        # exceed 0.85 at p<0.05; combined with F1 that would zero out almost
+        # every tail fill and leave the simulator under-trading. 0.70 keeps
+        # the model directionally honest.
+        q_toxic_extreme_cap: float = 0.70,
+        # F4 — extreme-price depth multiplier. Scales the visible-size
+        # haircut by an extra factor when the order rests in the tails
+        # (spoof rates are empirically 50-70% there vs 20-30% near mid).
+        depth_extreme_multiplier: float = 0.50,
+        depth_near_extreme_multiplier: float = 0.75,
     ):
         self.clob_base = clob_base.rstrip("/")
         self.book_poll_seconds = book_poll_seconds
@@ -213,6 +240,21 @@ class PaperExecutor:
         self.depth_haircut_enabled = bool(depth_haircut_enabled)
         self.maker_race_lost_pct = float(max(0.0, min(1.0, maker_race_lost_pct)))
         self.queue_advance_credit_pct = float(max(0.0, min(1.0, queue_advance_credit_pct)))
+        # F1
+        self.adverse_size_attenuation = float(max(0.0, adverse_size_attenuation))
+        self.min_fill_usdc = float(max(0.0, min_fill_usdc))
+        # F2
+        self.maker_race_lost_max = float(max(self.maker_race_lost_pct, min(1.0, maker_race_lost_max)))
+        # F3
+        self.q_toxic_extreme_cap = float(max(self.q_toxic, min(1.0, q_toxic_extreme_cap)))
+        # F4
+        self.depth_extreme_multiplier = float(max(0.0, min(1.0, depth_extreme_multiplier)))
+        self.depth_near_extreme_multiplier = float(max(0.0, min(1.0, depth_near_extreme_multiplier)))
+        # F7 — counters surfaced to the dashboard / structured logs
+        self.adverse_size_truncated_count: int = 0
+        self.extreme_race_lost_count: int = 0
+        self.extreme_q_toxic_capped_count: int = 0
+        self.depth_extreme_haircut_count: int = 0
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._book_cache: dict[str, dict] = {}        # token_id → book
@@ -528,103 +570,142 @@ class PaperExecutor:
         # standing) — this means joining a thicker book penalizes us.
         self._queue_debt[order.order_id] = min(prev, new_debt)
 
-    def _depth_multiplier(self, visible_size_usdc: float) -> float:
-        """Return a multiplier ∈ [0.5, 1.0] applied to visible book depth to
+    def _depth_multiplier(
+        self, visible_size_usdc: float, price: Optional[float] = None
+    ) -> float:
+        """Return a multiplier ∈ [0.25, 1.0] applied to visible book depth to
         emulate spoof / pulled liquidity in LIVE. Thinner books → bigger
         haircut. Tuned to be conservative: real spoof rate in low-liquidity
-        Polymarket crypto books has been observed at 30-50% in audits.
+        Polymarket crypto books has been observed at 30-50% in audits, and
+        50-70% in the deep tails (F4).
         """
         if not self.depth_haircut_enabled:
             return 1.0
         v = float(visible_size_usdc or 0.0)
         if v < 200.0:
-            return 0.50
-        if v < 500.0:
-            return 0.65
-        if v < 1000.0:
-            return 0.80
-        return 1.0
+            base = 0.50
+        elif v < 500.0:
+            base = 0.65
+        elif v < 1000.0:
+            base = 0.80
+        else:
+            base = 1.0
+        if price is None:
+            return base
+        # F4 — extra haircut in the tails. Spoof rate is empirically much
+        # higher when the resting level is far from mid; visible size there
+        # is mostly decorative quotes that cancel before our match lands.
+        p = max(0.0, min(1.0, float(price)))
+        if p < 0.15 or p > 0.85:
+            self.depth_extreme_haircut_count += 1
+            return base * self.depth_extreme_multiplier
+        if p < 0.25 or p > 0.75:
+            return base * self.depth_near_extreme_multiplier
+        return base
 
     def _effective_q_toxic(self, price: float) -> float:
-        """Scale q_toxic up at extreme prices.
+        """Scale q_toxic up at extreme prices, capped at q_toxic_extreme_cap.
 
         Rationale: in LIVE, a counterparty willing to sell YES at $0.05 or
         buy at $0.95 almost certainly has private information. Adverse
         selection ramps up as p moves away from 0.5. The quadratic
         `(1 - 4·p·(1-p))^2` gives 0 at p=0.5 and 1 at p∈{0,1}.
+
+        F3 — the absolute ceiling `q_toxic_extreme_cap` (default 0.70)
+        prevents the formula from saturating near 1.0 at p<0.05; without it,
+        F1 (size attenuation) would zero out almost every tail fill and the
+        simulator would stop trading entirely in the tails — losing the
+        ability to discover whether a real edge exists there.
         """
         if not self.q_toxic_extreme_scaling:
             return self.q_toxic
         p = max(0.001, min(0.999, float(price)))
         info_signal = (1.0 - 4.0 * p * (1.0 - p)) ** 2  # ∈ [0, 1]
         # Blend: at p=0.5 → base; at extremes → base + (1 - base) × signal
-        return float(self.q_toxic + (1.0 - self.q_toxic) * info_signal)
+        raw = self.q_toxic + (1.0 - self.q_toxic) * info_signal
+        if raw > self.q_toxic_extreme_cap:
+            self.extreme_q_toxic_capped_count += 1
+            return float(self.q_toxic_extreme_cap)
+        return float(raw)
+
+    def _effective_maker_race_lost_pct(self, price: float) -> float:
+        """F2 — ramp `maker_race_lost_pct` from base at p=0.5 up to
+        `maker_race_lost_max` in the tails using the same quadratic shape
+        as `_effective_q_toxic`. In LIVE, FIFO competition in tail quotes
+        is dominated by a few informed market makers; race losses there
+        are empirically 50-65%, not the 15% applied uniformly today.
+        """
+        if self.maker_race_lost_max <= self.maker_race_lost_pct:
+            return self.maker_race_lost_pct
+        p = max(0.001, min(0.999, float(price)))
+        info_signal = (1.0 - 4.0 * p * (1.0 - p)) ** 2  # ∈ [0, 1]
+        return float(
+            self.maker_race_lost_pct
+            + (self.maker_race_lost_max - self.maker_race_lost_pct) * info_signal
+        )
 
     def _try_match(self, order: RestingOrder, book: dict) -> Optional[_FillEvent]:
         if order.side == "BUY":
-            ask = book.get("best_ask")
-            ask_size_shares = float(book.get("ask_size", 0.0))
-            ask_size_usdc = ask_size_shares * (ask or 0.0)
-            if ask is None or ask > order.price + 1e-9:
-                return None
-            # If we still owe queue debt, we can't fill yet.
-            debt = self._queue_debt.get(order.order_id, 0.0)
-            if self.queue_position_enabled and debt > 0:
-                return None
-            # LIVE-realism: the visible ask size is partially spoof in thin
-            # books. Discount before computing fill size.
-            ask_size_usdc *= self._depth_multiplier(ask_size_usdc)
-            remaining = max(0.0, order.size_usdc - order.filled_size_usdc)
-            fill_size = min(remaining, ask_size_usdc)
-            if fill_size <= 0:
-                return None
-            # LIVE latency: taker race may lose. The crossing was visible to
-            # us via REST polling (≥1.5s lag), but in LIVE our IOC order needs
-            # ~150ms to reach the matching engine. By that time the maker may
-            # have cancelled or another taker beat us.
-            if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
-                return None
-            # LIVE maker race-lost: when the book crosses into a resting
-            # maker, FIFO priority can put us behind a competitor maker that
-            # joined microseconds earlier, or a fast IOC can hit ahead of us.
-            # Empirically 15% in thin Polymarket books.
-            if (not order.is_taker) and self._rng.random() < self.maker_race_lost_pct:
-                return None
-            q_tox = self._effective_q_toxic(order.price)
-            is_adverse = self._rng.random() < q_tox
-            fill_price = order.price
-            if is_adverse:
-                # Toxic taker — we get filled but the mark immediately moves
-                # adverse_haircut_pct against us. We model this by recording a
-                # WORSE effective fill price.
-                fill_price = order.price * (1.0 + self.adverse_haircut_pct)
-                fill_price = min(fill_price, 0.99)
+            counter_price = book.get("best_ask")
+            counter_size_shares = float(book.get("ask_size", 0.0))
+            counter_size_usdc = counter_size_shares * (counter_price or 0.0)
+            crossed = counter_price is not None and counter_price <= order.price + 1e-9
+            adverse_direction = +1
         else:  # SELL
-            bid = book.get("best_bid")
-            bid_size_shares = float(book.get("bid_size", 0.0))
-            bid_size_usdc = bid_size_shares * (bid or 0.0)
-            if bid is None or bid < order.price - 1e-9:
+            counter_price = book.get("best_bid")
+            counter_size_shares = float(book.get("bid_size", 0.0))
+            counter_size_usdc = counter_size_shares * (counter_price or 0.0)
+            crossed = counter_price is not None and counter_price >= order.price - 1e-9
+            adverse_direction = -1
+        if not crossed:
+            return None
+        # Queue debt gates the fill regardless of side.
+        debt = self._queue_debt.get(order.order_id, 0.0)
+        if self.queue_position_enabled and debt > 0:
+            return None
+        # F4 — visible-size haircut keyed off our resting price.
+        counter_size_usdc *= self._depth_multiplier(counter_size_usdc, price=order.price)
+        remaining = max(0.0, order.size_usdc - order.filled_size_usdc)
+        fill_size = min(remaining, counter_size_usdc)
+        if fill_size <= 0:
+            return None
+        # LIVE latency: taker race may lose. The crossing was visible via
+        # REST polling (≥1.5s lag), but our IOC needs ~150ms to reach the
+        # matching engine; the maker may cancel or another taker beat us.
+        if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
+            return None
+        # F2 — maker race-lost ramps with distance to mid. FIFO competition
+        # in the tails is dominated by a few informed market makers, so the
+        # effective race-lost rate is much higher than the flat base value.
+        if not order.is_taker:
+            race_lost_pct = self._effective_maker_race_lost_pct(order.price)
+            if self._rng.random() < race_lost_pct:
+                if race_lost_pct > self.maker_race_lost_pct + 1e-6:
+                    self.extreme_race_lost_count += 1
                 return None
-            debt = self._queue_debt.get(order.order_id, 0.0)
-            if self.queue_position_enabled and debt > 0:
+        q_tox = self._effective_q_toxic(order.price)
+        is_adverse = self._rng.random() < q_tox
+        fill_price = order.price
+        if is_adverse:
+            # F1 — informed counterparty: reduce SIZE proportional to q_tox
+            # AND nudge the effective fill price against us. Glosten-Milgrom
+            # adverse-selection magnitudes for binary prediction markets.
+            size_haircut = max(
+                0.0,
+                1.0 - min(1.0, q_tox * self.adverse_size_attenuation),
+            )
+            new_size = fill_size * size_haircut
+            if new_size + 1e-9 < fill_size:
+                self.adverse_size_truncated_count += 1
+            fill_size = new_size
+            if fill_size < self.min_fill_usdc:
+                # Treat as a no-fill: in LIVE the informed counter would
+                # have cancelled rather than show up at all.
                 return None
-            # Same depth haircut on the SELL side for symmetry.
-            bid_size_usdc *= self._depth_multiplier(bid_size_usdc)
-            remaining = max(0.0, order.size_usdc - order.filled_size_usdc)
-            fill_size = min(remaining, bid_size_usdc)
-            if fill_size <= 0:
-                return None
-            # LIVE latency race (see BUY branch above).
-            if order.is_taker and self._rng.random() < self.taker_race_lost_pct:
-                return None
-            if (not order.is_taker) and self._rng.random() < self.maker_race_lost_pct:
-                return None
-            q_tox = self._effective_q_toxic(order.price)
-            is_adverse = self._rng.random() < q_tox
-            fill_price = order.price
-            if is_adverse:
-                fill_price = order.price * (1.0 - self.adverse_haircut_pct)
-                fill_price = max(fill_price, 0.01)
+            # Mark moves against us. adverse_direction = +1 for BUY (price
+            # rises after we hit), -1 for SELL (price falls).
+            fill_price = order.price * (1.0 + adverse_direction * self.adverse_haircut_pct)
+            fill_price = max(0.01, min(0.99, fill_price))
 
         order.filled_size_usdc += fill_size
         # Fee accounting splits on whether this order crossed the book at

@@ -193,6 +193,17 @@ class MakerOrderEngine:
         cross_threshold_ticks: float = 4.0,
         placement_logger: Optional[Callable[[RestingOrder, float], None]] = None,
         min_order_usdc: float = 5.0,
+        # F5 — extreme price guard. When the candidate quote sits outside the
+        # [extreme_price_min, extreme_price_max] band, the edge requirement is
+        # multiplied by extreme_edge_multiplier. Counterparties willing to
+        # transact in the tails of a binary prediction market are dominated by
+        # informed traders; even a quote that *looks* favourable on paper
+        # bleeds money once adverse selection is priced in. Defaults disable
+        # quoting in the deep tails unless the model edge is 4× the normal
+        # threshold (e.g. 8 cents vs 2 cents).
+        extreme_price_min: float = 0.10,
+        extreme_price_max: float = 0.90,
+        extreme_edge_multiplier: float = 4.0,
     ):
         self.min_order_usdc = float(max(0.0, min_order_usdc))
         self.executor = executor
@@ -219,6 +230,13 @@ class MakerOrderEngine:
         # Fee model
         self.fee_rate = float(fee_rate)
         self.maker_rebate_share = float(maker_rebate_share)
+
+        # F5 — extreme price guard
+        self.extreme_price_min = float(max(0.0, min(0.5, extreme_price_min)))
+        self.extreme_price_max = float(min(1.0, max(0.5, extreme_price_max)))
+        self.extreme_edge_multiplier = float(max(1.0, extreme_edge_multiplier))
+        self.extreme_price_blocked_period: int = 0
+        self.extreme_price_blocked_lifetime: int = 0
 
         # Quote-mode dispatch (see module-level docstring on QUOTE_MODE_*).
         if quote_mode not in _VALID_QUOTE_MODES:
@@ -260,6 +278,20 @@ class MakerOrderEngine:
         self.upsert_noop_period = 0
         self.upsert_replace_period = 0
         self.upsert_debounce_period = 0
+        self.extreme_price_blocked_period = 0
+
+    def _extreme_edge_threshold(self, candidate_price: float) -> float:
+        """Return the effective edge threshold for a quote at `candidate_price`.
+
+        In the extremes (p < extreme_price_min or p > extreme_price_max), the
+        bot needs a far larger model edge to compensate for the heightened
+        adverse-selection it will face from informed counterparties. Returns
+        the regular `edge_threshold` everywhere else.
+        """
+        p = float(candidate_price)
+        if p < self.extreme_price_min or p > self.extreme_price_max:
+            return self.edge_threshold * self.extreme_edge_multiplier
+        return self.edge_threshold
 
     # ─── public API ─────────────────────────────────────────────
     async def reconcile(
@@ -436,18 +468,36 @@ class MakerOrderEngine:
         """
         bid_price: Optional[float] = None
         ask_price: Optional[float] = None
-        post_bid = (c.edge_bid_net > self.edge_threshold) and not c.inv_blocks_bid
-        post_ask = (c.edge_ask_net > self.edge_threshold) and not c.inv_blocks_ask
+
+        # F5 — apply extreme-price guard. Use the candidate level the bid would
+        # actually rest at (best_bid for a join, best_bid + tick for a penny).
+        bid_candidate = c.poly_best_bid + c.tick if c.edge_bid_net >= 2.0 * c.tick else c.poly_best_bid
+        ask_candidate = c.poly_best_ask - c.tick if c.edge_ask_net >= 2.0 * c.tick else c.poly_best_ask
+        bid_thr = self._extreme_edge_threshold(bid_candidate)
+        ask_thr = self._extreme_edge_threshold(ask_candidate)
+
+        post_bid = (c.edge_bid_net > bid_thr) and not c.inv_blocks_bid
+        post_ask = (c.edge_ask_net > ask_thr) and not c.inv_blocks_ask
+
+        # Counter accounting: only count as "extreme blocked" the quotes that
+        # would have fired at the regular threshold but were vetoed by the
+        # extreme multiplier. This isolates F5's effect from other gates.
+        if (not post_bid) and not c.inv_blocks_bid and bid_thr > self.edge_threshold \
+                and c.edge_bid_net > self.edge_threshold:
+            self.extreme_price_blocked_period += 1
+            self.extreme_price_blocked_lifetime += 1
+        if (not post_ask) and not c.inv_blocks_ask and ask_thr > self.edge_threshold \
+                and c.edge_ask_net > self.edge_threshold:
+            self.extreme_price_blocked_period += 1
+            self.extreme_price_blocked_lifetime += 1
 
         if post_bid:
-            penny = c.poly_best_bid + c.tick if c.edge_bid_net >= 2.0 * c.tick else c.poly_best_bid
-            cand = max(c.raw_bid, penny)
+            cand = max(c.raw_bid, bid_candidate)
             ceiling = round(c.poly_best_ask - c.tick, 4) if c.poly_best_ask > 0 else 0.99
             bid_price = _round_tick(max(0.01, min(cand, ceiling, 0.99)), c.tick)
 
         if post_ask:
-            penny = c.poly_best_ask - c.tick if c.edge_ask_net >= 2.0 * c.tick else c.poly_best_ask
-            cand = min(c.raw_ask, penny)
+            cand = min(c.raw_ask, ask_candidate)
             floor_ = round(c.poly_best_bid + c.tick, 4) if c.poly_best_bid > 0 else 0.01
             ask_price = _round_tick(min(0.99, max(cand, floor_, 0.01)), c.tick)
 

@@ -239,6 +239,15 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             depth_haircut_enabled=bool(paper_cfg_v.get("depth_haircut_enabled", True)),
             maker_race_lost_pct=float(paper_cfg_v.get("maker_race_lost_pct", 0.15)),
             queue_advance_credit_pct=float(paper_cfg_v.get("queue_advance_credit_pct", 0.50)),
+            # Post-audit fidelity fixes (2026-05-09). Defaults match the
+            # PaperExecutor constructor's so behavior is unchanged unless
+            # the variant explicitly overrides under `paper:`.
+            adverse_size_attenuation=float(paper_cfg_v.get("adverse_size_attenuation", 1.0)),
+            min_fill_usdc=float(paper_cfg_v.get("min_fill_usdc", 0.50)),
+            maker_race_lost_max=float(paper_cfg_v.get("maker_race_lost_max", 0.65)),
+            q_toxic_extreme_cap=float(paper_cfg_v.get("q_toxic_extreme_cap", 0.70)),
+            depth_extreme_multiplier=float(paper_cfg_v.get("depth_extreme_multiplier", 0.50)),
+            depth_near_extreme_multiplier=float(paper_cfg_v.get("depth_near_extreme_multiplier", 0.75)),
         )
 
         # Per-variant bankroll: prefer the per-variant override, fall back to
@@ -295,6 +304,11 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             cross_threshold_ticks=float(eff.get("cross_threshold_ticks", 4.0)),
             placement_logger=placement_logger,
             min_order_usdc=float(eff.get("min_order_usdc", 5.0)),
+            # F5 — extreme price guard. Per-variant overrides go under
+            # `extreme_price_min / extreme_price_max / extreme_edge_multiplier`.
+            extreme_price_min=float(eff.get("extreme_price_min", 0.10)),
+            extreme_price_max=float(eff.get("extreme_price_max", 0.90)),
+            extreme_edge_multiplier=float(eff.get("extreme_edge_multiplier", 4.0)),
         )
         cycle = CryptoLagCycle(
             config=config, feed=feed, registry=registry, executor=executor,

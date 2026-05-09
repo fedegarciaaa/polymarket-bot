@@ -653,6 +653,154 @@ def api_crypto_lag_closes():
     })
 
 
+@app.route("/api/crypto_lag/fidelity")
+def api_crypto_lag_fidelity():
+    """Surface the F1-F5 fidelity counters from the most recent
+    CRYPTO_LAG_VARIANT_STATS event per variant in logs/events.jsonl.
+
+    Lifetime totals tell us whether the post-audit filters are firing at
+    the rate we expect. If `extreme_price_blocked_period` stays at 0 across
+    several hours, the F5 guard is mis-wired.
+    """
+    if not EVENTS_PATH.exists():
+        return jsonify({"available": False, "by_variant": {}})
+    latest_by_variant: dict = {}
+    try:
+        # Iterate forward so the last seen event per variant wins.
+        for raw in EVENTS_PATH.read_text(encoding="utf-8").splitlines()[-3000:]:
+            if not raw.strip() or "CRYPTO_LAG_VARIANT_STATS" not in raw:
+                continue
+            try:
+                ev = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "CRYPTO_LAG_VARIANT_STATS":
+                continue
+            data = ev.get("data") or {}
+            v = data.get("variant") or "unknown"
+            latest_by_variant[v] = {
+                "ts": ev.get("ts"),
+                "period_seconds": data.get("period_seconds"),
+                "placements": data.get("placements"),
+                "fills": data.get("fills"),
+                "fill_rate": data.get("fill_rate"),
+                "net_pnl_usdc": data.get("net_pnl_usdc"),
+                # F7 counters
+                "adverse_size_truncated_lifetime": data.get("adverse_size_truncated_lifetime"),
+                "extreme_race_lost_lifetime": data.get("extreme_race_lost_lifetime"),
+                "extreme_q_toxic_capped_lifetime": data.get("extreme_q_toxic_capped_lifetime"),
+                "depth_extreme_haircut_lifetime": data.get("depth_extreme_haircut_lifetime"),
+                "extreme_price_blocked_period": data.get("extreme_price_blocked_period"),
+            }
+    except Exception:
+        return jsonify({"available": False, "by_variant": {}})
+    return jsonify({"available": True, "by_variant": latest_by_variant})
+
+
+@app.route("/api/crypto_lag/price_buckets")
+def api_crypto_lag_price_buckets():
+    """Distribution of fills by entry-price bucket over the last 24h.
+
+    Tail-bucket counts (p<0.05, p>0.95) collapsing toward 0 after F1-F5
+    deploy is the single most direct signal that the simulator stopped
+    farming the orderbook tails for fake PnL.
+    """
+    variant = _variant_arg()
+    d = db()
+    if not _has_crypto_lag_tables(d.conn):
+        d.close()
+        return jsonify({"available": False, "buckets": []})
+    has_var = _has_variant_column(d.conn)
+    cutoff = datetime.now(timezone.utc).timestamp() - 86400
+    bucket_sql = """
+        SELECT
+            CASE
+                WHEN price < 0.05 THEN 'a) <0.05'
+                WHEN price < 0.10 THEN 'b) 0.05-0.10'
+                WHEN price < 0.15 THEN 'c) 0.10-0.15'
+                WHEN price < 0.30 THEN 'd) 0.15-0.30'
+                WHEN price < 0.70 THEN 'e) 0.30-0.70'
+                WHEN price < 0.85 THEN 'f) 0.70-0.85'
+                WHEN price < 0.90 THEN 'g) 0.85-0.90'
+                WHEN price < 0.95 THEN 'h) 0.90-0.95'
+                ELSE              'i) >=0.95'
+            END AS bucket,
+            COUNT(*) AS n_fills,
+            ROUND(SUM(fill_size_usdc), 2) AS total_filled
+        FROM crypto_lag_quotes
+        WHERE status IN ('filled','partially_filled') AND ts >= ?
+    """
+    params = [cutoff]
+    if has_var:
+        bucket_sql += " AND variant = ?"
+        params.append(variant)
+    bucket_sql += " GROUP BY bucket ORDER BY bucket"
+    rows = d.conn.execute(bucket_sql, params).fetchall()
+    d.close()
+    return jsonify({
+        "available": True,
+        "buckets": [dict(r) for r in rows],
+    })
+
+
+@app.route("/api/crypto_lag/outliers")
+def api_crypto_lag_outliers():
+    """Top closes by PnL / gross_filled ratio over the last 24h.
+
+    Pre-F1-F5 the top ratio was ~97x consistently (entry at p≈0.01,
+    resolution to 1.0). Post-fix we expect this to fall under 5x. The
+    endpoint surfaces it so the user can eyeball the metric without
+    running ad-hoc SQL.
+    """
+    from flask import request
+    n = int(request.args.get("n", 10))
+    variant = _variant_arg()
+    d = db()
+    if not _has_crypto_lag_tables(d.conn):
+        d.close()
+        return jsonify({"available": False, "outliers": []})
+    has_var = _has_variant_column(d.conn)
+    cutoff = datetime.now(timezone.utc).timestamp() - 86400
+    if has_var:
+        sql = """
+            SELECT c.ts, c.variant, c.symbol, c.condition_id,
+                   c.realized_pnl_usdc AS pnl,
+                   c.final_yes_price   AS yes_close,
+                   COALESCE((SELECT SUM(fill_size_usdc) FROM crypto_lag_quotes q
+                             WHERE q.condition_id = c.condition_id
+                               AND q.variant = c.variant
+                               AND q.status IN ('filled','partially_filled')), 0.0) AS gross
+            FROM crypto_lag_closes c
+            WHERE c.ts >= ? AND c.variant = ? AND c.realized_pnl_usdc IS NOT NULL
+        """
+        params = (cutoff, variant)
+    else:
+        sql = """
+            SELECT c.ts, c.symbol, c.condition_id,
+                   c.realized_pnl_usdc AS pnl,
+                   c.final_yes_price   AS yes_close,
+                   COALESCE((SELECT SUM(fill_size_usdc) FROM crypto_lag_quotes q
+                             WHERE q.condition_id = c.condition_id
+                               AND q.status IN ('filled','partially_filled')), 0.0) AS gross
+            FROM crypto_lag_closes c
+            WHERE c.ts >= ? AND c.realized_pnl_usdc IS NOT NULL
+        """
+        params = (cutoff,)
+    rows = d.conn.execute(sql, params).fetchall()
+    d.close()
+    enriched = []
+    for r in rows:
+        rec = dict(r)
+        gross = float(rec.get("gross") or 0.0)
+        pnl = float(rec.get("pnl") or 0.0)
+        rec["ratio"] = round(pnl / gross, 2) if gross > 0.01 else None
+        rec["pnl"] = round(pnl, 2)
+        rec["gross"] = round(gross, 2)
+        enriched.append(rec)
+    enriched.sort(key=lambda r: (r["ratio"] is None, -(r["ratio"] or 0.0)))
+    return jsonify({"available": True, "outliers": enriched[:n]})
+
+
 # ============================================================
 # HTML
 # ============================================================
@@ -706,10 +854,31 @@ HTML = """
   .reason-box{font-size:11px;color:#c9d1d9;background:#0d1117;border-left:3px solid #21262d;padding:4px 8px;margin-top:4px;white-space:pre-wrap;word-break:break-all}
 
   /* ─── Crypto-Lag section ─────────────────────────────────── */
-  .cl-variant-tag{display:inline-block;margin-left:10px;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;vertical-align:middle}
+  .cl-variant-tag{display:inline-block;margin-left:10px;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;vertical-align:middle;background:#1c2129;color:#79c0ff;border:1px solid #79c0ff44}
+  .cl-variant-tag[data-variant="maker_wide_spread"]{background:#0d2615;color:#3fb950;border:1px solid #3fb95044}
+  .cl-variant-tag[data-variant="maker_focused"]{background:#0d1f40;color:#58a6ff;border:1px solid #58a6ff44}
+  .cl-variant-tag[data-variant="maker_near_2h"]{background:#1a1509;color:#d29922;border:1px solid #d2992244}
+  .cl-variant-tag[data-variant="maker_near_30m"]{background:#1f0a09;color:#f85149;border:1px solid #f8514944}
+  .cl-variant-tag[data-variant="maker_near_60m"]{background:#1c1a30;color:#a371f7;border:1px solid #a371f744}
+  /* Legacy variants (kept for backwards-compat with archived runs) */
   .cl-variant-tag[data-variant="main"]{background:#0d2615;color:#3fb950;border:1px solid #3fb95044}
   .cl-variant-tag[data-variant="permissive"]{background:#1a1509;color:#d29922;border:1px solid #d2992244}
-  .cl-variant-tag[data-variant="aggressive"]{background:#1f0a09;color:#f85149;border:1px solid #f8514944}
+  /* ─── Fidelity panel ─────────────────────────────────────── */
+  .cl-fidelity{background:#0b1320;border:1px solid #21262d;border-left:3px solid #58a6ff;border-radius:8px;padding:10px 14px;margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+  .cl-fidelity .f-cell{display:flex;flex-direction:column}
+  .cl-fidelity .f-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em}
+  .cl-fidelity .f-value{font-size:18px;font-weight:700;color:#c9d1d9;margin-top:3px}
+  .cl-fidelity .f-value.f-zero{color:#6e7681}
+  .cl-fidelity .f-value.f-active{color:#3fb950}
+  .cl-fidelity .f-sub{font-size:10px;color:#8b949e;margin-top:2px}
+  .cl-fidelity-title{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+  .cl-fidelity-title .f-pill{font-size:9px;padding:1px 6px;border-radius:6px;background:#0d2615;color:#3fb950;border:1px solid #3fb95044}
+  .cl-fidelity-title .f-pill.f-warn{background:#2d1f00;color:#d29922;border-color:#d2992244}
+  /* ─── Outliers table ─────────────────────────────────────── */
+  .cl-outlier-ratio{font-weight:700}
+  .cl-outlier-ratio.bad{color:#f85149}
+  .cl-outlier-ratio.warn{color:#d29922}
+  .cl-outlier-ratio.ok{color:#3fb950}
   .cl-header{display:flex;flex-direction:column;gap:2px;margin-top:10px}
   .cl-icon{width:18px;height:18px;color:#f7931a;vertical-align:-3px;margin-right:6px}
   .cl-status-badge{margin-left:8px;display:inline-block;vertical-align:middle}
@@ -838,6 +1007,20 @@ HTML = """
     <div class="card" data-cl="kpi-fills"><div class="label">Fills 24h</div><div class="value muted">—</div></div>
     <div class="card" data-cl="kpi-wr"><div class="label">Win Rate 24h</div><div class="value muted">—</div></div>
     <div class="card" data-cl="kpi-cap"><div class="label">Capital Usado</div><div class="value muted">—</div></div>
+    <div class="card" data-cl="kpi-tail-ratio"><div class="label">Max PnL/Gross 24h</div><div class="value muted">—</div></div>
+  </div>
+
+  <!-- Fidelity panel: confirms F1-F5 filters are firing live. -->
+  <div data-cl="fidelity-panel" class="cl-fidelity">
+    <div class="cl-fidelity-title" style="grid-column:1/-1">
+      Fidelity filters (post-audit) <span data-cl="fidelity-status" class="f-pill">—</span>
+      <span style="margin-left:auto;font-size:10px;color:#6e7681">Lifetime totals · CRYPTO_LAG_VARIANT_STATS</span>
+    </div>
+    <div class="f-cell"><div class="f-label">F5 · extreme price blocked</div><div class="f-value f-zero" data-cl="f-block">—</div><div class="f-sub">last period</div></div>
+    <div class="f-cell"><div class="f-label">F1 · adverse size truncated</div><div class="f-value f-zero" data-cl="f-truncated">—</div><div class="f-sub">cumulative fills</div></div>
+    <div class="f-cell"><div class="f-label">F2 · extreme race lost</div><div class="f-value f-zero" data-cl="f-race">—</div><div class="f-sub">cumulative tail races</div></div>
+    <div class="f-cell"><div class="f-label">F3 · q_toxic capped</div><div class="f-value f-zero" data-cl="f-cap">—</div><div class="f-sub">cumulative cap hits</div></div>
+    <div class="f-cell"><div class="f-label">F4 · depth haircut tail</div><div class="f-value f-zero" data-cl="f-depth">—</div><div class="f-sub">cumulative tail haircuts</div></div>
   </div>
 
   <div class="cl-grid">
@@ -859,6 +1042,14 @@ HTML = """
     <div class="cl-chart-card">
       <div class="cl-chart-title">Distribución de decisiones (24h)</div>
       <div class="cl-chart-body cl-donut-body"><canvas data-cl="chart-decisions"></canvas></div>
+    </div>
+    <div class="cl-chart-card">
+      <div class="cl-chart-title">Fills por bucket de precio (24h) · colas = fugas potenciales</div>
+      <div class="cl-chart-body"><canvas data-cl="chart-buckets"></canvas></div>
+    </div>
+    <div class="cl-chart-card">
+      <div class="cl-chart-title">Top closes por ratio PnL/gross (24h) · &gt;5x = sospechoso</div>
+      <div class="cl-chart-body" style="overflow:auto"><div data-cl="outliers-table"></div></div>
     </div>
   </div>
 
@@ -1282,19 +1473,28 @@ function clCloneSectionForVariant(variant){
   // Reset any chart canvases in the clone — Chart.js will (re)attach on next render.
   clone.querySelectorAll('canvas').forEach(c => { c.removeAttribute('id'); });
   // Clear the dynamic table containers so we don't carry main's HTML over.
-  clone.querySelectorAll('[data-cl="fills-table"], [data-cl="closes-table"]').forEach(c => {
+  clone.querySelectorAll('[data-cl="fills-table"], [data-cl="closes-table"], [data-cl="outliers-table"]').forEach(c => {
     c.innerHTML = '';
   });
   // Reset KPI cards to their loading state
-  ['kpi-pnl','kpi-fills','kpi-wr','kpi-cap'].forEach(role => {
+  ['kpi-pnl','kpi-fills','kpi-wr','kpi-cap','kpi-tail-ratio'].forEach(role => {
     const el = clEl(clone, role);
     if(!el) return;
     const labelMap = {
       'kpi-pnl':'P&L Total', 'kpi-fills':'Fills 24h',
       'kpi-wr':'Win Rate 24h', 'kpi-cap':'Capital Usado',
+      'kpi-tail-ratio':'Max PnL/Gross 24h',
     };
     el.innerHTML =
       `<div class="label">${labelMap[role]}</div><div class="value muted">—</div>`;
+  });
+  // Reset fidelity counters too — clone inherits placeholders.
+  clone.querySelectorAll('[data-cl^="f-"]').forEach(el => {
+    if(el.classList.contains('f-value')){
+      el.textContent = '—';
+      el.classList.remove('f-active');
+      el.classList.add('f-zero');
+    }
   });
   tpl.parentNode.appendChild(clone);
 }
@@ -1304,12 +1504,18 @@ function clSetVariantTag(section, variant){
   const tag = clEl(section, 'variant-tag');
   if(!tag) return;
   tag.setAttribute('data-variant', variant);
-  // Friendly labels
+  // Friendly labels — updated 2026-05-09 post-audit. The legacy
+  // (main/permissive/near_*) entries stay for replays of archived runs.
   const labels = {
-    main: 'main (penny_aggressive)',
-    permissive: 'permissive (maker only)',
-    near_2h: 'near_2h (T<2h)',
-    near_30m: 'near_30m (T<30min)',
+    maker_wide_spread: 'maker_wide_spread (spread≥3t)',
+    maker_focused:     'maker_focused (T<60m + spread≥2t)',
+    maker_near_2h:     'maker_near_2h (T<2h, paused)',
+    maker_near_30m:    'maker_near_30m (T<30m, paused)',
+    maker_near_60m:    'maker_near_60m (T<60m, paused)',
+    main:              'main (legacy)',
+    permissive:        'permissive (legacy)',
+    near_2h:           'near_2h (legacy)',
+    near_30m:          'near_30m (legacy)',
   };
   tag.textContent = labels[variant] || variant;
 }
@@ -1379,7 +1585,138 @@ async function refreshCryptoLag(variant){
     clRenderFills(section, fills);
     const closes = await fetch(`/api/crypto_lag/closes?n=12&variant=${encodeURIComponent(variant)}`).then(r=>r.json());
     clRenderCloses(section, closes);
+
+    // F7 fidelity panel — counters from CRYPTO_LAG_VARIANT_STATS events.
+    const fid = await fetch('/api/crypto_lag/fidelity').then(r=>r.json());
+    clRenderFidelity(section, variant, fid);
+
+    // Price-bucket histogram and outliers ratio table.
+    const buckets = await fetch(`/api/crypto_lag/price_buckets?variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderBucketChart(variant, section, buckets);
+    const out = await fetch(`/api/crypto_lag/outliers?n=8&variant=${encodeURIComponent(variant)}`).then(r=>r.json());
+    clRenderOutliers(section, out);
   } catch(e){ console.warn(`crypto_lag[${variant}] refresh:`, e); }
+}
+
+function clRenderFidelity(section, variant, payload){
+  const set = (role, val, sub) => {
+    const el = section.querySelector(`[data-cl="${role}"]`);
+    if(!el) return;
+    const n = Number(val||0);
+    el.textContent = n.toLocaleString();
+    el.classList.toggle('f-zero', n === 0);
+    el.classList.toggle('f-active', n > 0);
+    if(sub){
+      const subEl = el.parentElement.querySelector('.f-sub');
+      if(subEl) subEl.textContent = sub;
+    }
+  };
+  const stat = section.querySelector('[data-cl="fidelity-status"]');
+  const data = payload && payload.available && payload.by_variant && payload.by_variant[variant];
+  if(!data){
+    if(stat){ stat.textContent = 'sin telemetría aún'; stat.classList.add('f-warn'); }
+    set('f-block', 0); set('f-truncated', 0); set('f-race', 0); set('f-cap', 0); set('f-depth', 0);
+    return;
+  }
+  set('f-block', data.extreme_price_blocked_period);
+  set('f-truncated', data.adverse_size_truncated_lifetime);
+  set('f-race', data.extreme_race_lost_lifetime);
+  set('f-cap', data.extreme_q_toxic_capped_lifetime);
+  set('f-depth', data.depth_extreme_haircut_lifetime);
+  if(stat){
+    const fired = (data.extreme_price_blocked_period||0)
+      + (data.adverse_size_truncated_lifetime||0)
+      + (data.extreme_race_lost_lifetime||0);
+    if(fired > 0){
+      stat.textContent = 'F1-F5 activos';
+      stat.classList.remove('f-warn');
+    } else {
+      stat.textContent = '0 disparos · revisar wiring';
+      stat.classList.add('f-warn');
+    }
+  }
+}
+
+function clRenderBucketChart(variant, section, payload){
+  const canvas = section.querySelector('[data-cl="chart-buckets"]');
+  if(!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const buckets = (payload && payload.buckets) || [];
+  if(!buckets.length){
+    const old = (CL.charts[variant]||{}).buckets;
+    if(old){ try{ old.destroy(); }catch(_){} delete CL.charts[variant].buckets; }
+    return;
+  }
+  const labels = buckets.map(b => {
+    const idx = b.bucket.indexOf(') ');
+    return idx >= 0 ? b.bucket.slice(idx + 2) : b.bucket;
+  });
+  // Tail buckets (<0.15 / >0.85) are flagged red — they are exactly where
+  // the pre-fix simulator was farming fake PnL.
+  const colors = buckets.map(b => {
+    const k = b.bucket;
+    if(k.startsWith('a)') || k.startsWith('b)') || k.startsWith('h)') || k.startsWith('i)')) return '#f85149';
+    if(k.startsWith('c)') || k.startsWith('g)')) return '#d29922';
+    return '#3fb950';
+  });
+  clEnsureChart(variant, 'buckets', ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Fills (count)',
+        data: buckets.map(b => b.n_fills),
+        backgroundColor: colors, borderWidth: 0,
+      }],
+    },
+    options: {
+      ...clCommonOpts,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color:'#8b949e', font:{size:10} }, grid: { display:false } },
+        y: { ticks: { color:'#8b949e', font:{size:10} }, grid: { color:'#21262d' }, beginAtZero: true },
+      },
+    },
+  });
+}
+
+function clRenderOutliers(section, payload){
+  const t = section.querySelector('[data-cl="outliers-table"]');
+  if(!t) return;
+  const rows = (payload && payload.outliers) || [];
+  if(!rows.length){ t.innerHTML = '<p class="cl-empty">Sin closes con ratio computable en 24h.</p>'; return; }
+  t.innerHTML = '<table><tr><th>Hora</th><th>Símbolo</th><th>P&amp;L</th><th>Gross</th><th>Ratio</th><th>YES close</th></tr>'
+    + rows.map(r => {
+        const ratio = r.ratio;
+        const cls = ratio == null ? 'muted'
+          : ratio >= 5 ? 'cl-outlier-ratio bad'
+          : ratio >= 2 ? 'cl-outlier-ratio warn'
+          : 'cl-outlier-ratio ok';
+        const ratioTxt = ratio == null ? '—' : ratio.toFixed(1) + 'x';
+        const pnlCls = (r.pnl||0) >= 0 ? 'pos' : 'neg';
+        return `<tr>
+          <td class="muted">${CL.fmtTime(r.ts)}</td>
+          <td><b>${r.symbol}</b></td>
+          <td class="${pnlCls}">${CL.fmtUsd(r.pnl)}</td>
+          <td>$${(r.gross||0).toFixed(2)}</td>
+          <td class="${cls}">${ratioTxt}</td>
+          <td>${(r.yes_close!=null) ? r.yes_close.toFixed(2) : '—'}</td>
+        </tr>`;
+      }).join('')
+    + '</table>';
+  // Surface the worst ratio as a top-row KPI.
+  const worst = rows.reduce((m, r) => (r.ratio != null && r.ratio > (m||0)) ? r.ratio : m, null);
+  const kpi = section.querySelector('[data-cl="kpi-tail-ratio"]');
+  if(kpi){
+    const cls = worst == null ? 'muted'
+      : worst >= 5 ? 'neg'
+      : worst >= 2 ? 'warn-c'
+      : 'pos';
+    const txt = worst == null ? '—' : worst.toFixed(1) + 'x';
+    kpi.innerHTML = `<div class="label">Max PnL/Gross 24h</div>
+      <div class="value ${cls}">${txt}</div>
+      <div class="kpi-sub muted">objetivo post-fix &le; 5x</div>`;
+  }
 }
 
 function clRenderPriceChart(variant, section, snap){
