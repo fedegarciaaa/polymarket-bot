@@ -1575,16 +1575,40 @@ function clRenderCloses(section, payload){
     + '</table>';
 }
 
-/** Discover variants from the server and clone the section for each extra one. */
+/** Discover variants from the server and clone the section for each enabled one.
+ *
+ * Strategy: the HTML has ONE pre-built section with data-variant="main".
+ * If the enabled-variant list from the server contains "main", we re-use
+ * that section in place. If not, we keep the "main" section hidden as a
+ * cloning template and clone it for every enabled variant. This avoids an
+ * orphan empty "main" section when main is disabled in config.
+ */
 async function clDiscoverAndBindVariants(){
   if(CL.bound) return;
   try {
     const res = await fetch('/api/crypto_lag/variants').then(r=>r.json());
-    const list = (res && res.variants && res.variants.map(v=>v.name)) || ['main'];
-    // Always include 'main' first (the visible template).
-    const ordered = ['main', ...list.filter(v => v !== 'main')];
-    CL.variants = ordered;
-    ordered.forEach(v => { if(v !== 'main') clCloneSectionForVariant(v); });
+    const list = (res && res.variants && res.variants.map(v=>v.name)) || [];
+    const mainTpl = clSection('main');
+    if(list.length === 0){
+      // Endpoint unavailable; keep the visible main template as fallback
+      // so the page isn't blank.
+      CL.variants = ['main'];
+    } else {
+      const mainEnabled = list.includes('main');
+      // Clone a section for every enabled variant other than main (if main
+      // is enabled, the existing template IS its section).
+      list.forEach(v => {
+        if(v === 'main') return;
+        if(!clSection(v)) clCloneSectionForVariant(v);
+      });
+      // If main is NOT enabled, hide the template so we don't show an
+      // empty "main" panel. The clones above already exist as standalone
+      // sections (cloned BEFORE this hide step).
+      if(!mainEnabled && mainTpl){
+        mainTpl.style.display = 'none';
+      }
+      CL.variants = list;
+    }
     CL.bound = true;
   } catch(e) {
     console.warn('crypto_lag: variant discovery failed, using main only', e);
