@@ -459,23 +459,38 @@ crypto_lag:
         queue_position_enabled: true
         q_toxic: 0.20
     permissive:
-      # REACTIVADO 2026-05-08 con estrategia ORTOGONAL a main:
-      #   - main:       penny_aggressive — post inside spread cuando se puede,
-      #                 cruza con IOC cuando spread=1c. Termina cruzando >90%.
-      #   - permissive: maker (post-only puro) — NUNCA cruza. Edge mínimo
-      #                 más estricto (3c) para que solo poste cuando hay
-      #                 holgura clara. Tests si el rebate maker (que en main
-      #                 nunca se materializa porque siempre termina cruzando)
-      #                 puede ser una vía rentable distinta.
-      # Si esta variante consigue >50 maker fills en 24h con rebate>fees
-      # acumulado, demuestra que sí hay edge maker y aplicaríamos los
-      # aprendizajes a main. Si tras 48h tiene 0 fills (cola siempre rota
-      # antes), confirma que penny_aggressive era la única vía y reverte.
-      enabled: true
-      bankroll_usdc: 1000.0            # bankroll independiente de main
-      quote_mode: maker                # POST-ONLY puro, nunca cruza
-      edge_threshold_cents: 3          # más estricto que main (que es 2c)
-      cross_threshold_ticks: 999.0     # nunca cruzar (efectivamente off)
+      # APAGADO 2026-05-09 tras 11h del weekend run:
+      # 5 closes en 11h, last_placement 10h ago, bankroll $946.
+      # Causa: sin filtro temporal, opera markets de hasta 24h. Las
+      # posiciones tomadas en primeras horas llenaron el cap
+      # variant_committed=$500 con markets que NO resuelven en 24h —
+      # el bot quedó atascado sin capacidad para colocar más.
+      # Mismo problema estructural que tenía main pero menos visible
+      # porque permissive es maker (no quema capital cruzando, solo
+      # capital opportunity-cost por estar trapped).
+      # Reemplazado por maker_near_60m (filtro 1h intermedio).
+      enabled: false
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0
       paper:
-        queue_position_enabled: true   # cola SÍ cuenta en maker
-        q_toxic: 0.20                  # algo menos adverse que main (no cruzamos)
+        queue_position_enabled: true
+        q_toxic: 0.20
+    maker_near_60m:
+      # NUEVO 2026-05-09: reemplaza a permissive. Maker-only con filtro
+      # T<60min — punto medio entre maker_near_30m (más agresivo) y
+      # maker_near_2h (más permissivo). El filtro temporal evita que
+      # el cap committed se atasque con markets de 24h+ en futuro.
+      # Hipótesis: si funciona similar a maker_wide_spread (que tiene
+      # filtro de spread, no temporal), tenemos 4 estrategias maker
+      # con orthogonal filters y todas rentables.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0
+      max_seconds_to_resolution: 3600  # 60 minutos
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.20
