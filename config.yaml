@@ -526,3 +526,38 @@ crypto_lag:
       paper:
         queue_position_enabled: true
         q_toxic: 0.20
+    maker_aggressive:
+      # NUEVO 2026-05-09: boundary test del threshold de edge.
+      # Mismo modelo que las 5 baseline pero `edge_threshold_cents=2`
+      # (default del engine, vs 3 del resto). En tails F5 multiplica
+      # ×4 → 8 cents efectivo. Hipótesis: si F1-F5 son honestos, esta
+      # variante debería perder o break-even — fires marginales (edge
+      # bajo) deberían ser dominados por adverse selection. Si gana
+      # como maker_wide_spread, el threshold óptimo es ≤2 O el
+      # simulador todavía deja un sesgo en mid-band.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 2          # vs 3 baseline — boundary inferior
+      cross_threshold_ticks: 999.0
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.20
+    maker_selective:
+      # NUEVO 2026-05-09: top-conviction-only test.
+      # `edge_threshold_cents=6` (vs 3 baseline). En tails F5 → 24 cents
+      # → efectivamente bloquea quotes en colas. Filtros temporales
+      # leves para mantener volumen razonable. Hipótesis: si el modelo
+      # BS-digital tiene edge real, esta variante debería mostrar mejor
+      # PnL/fill aunque con menos closes/h. Si rinde igual o peor que
+      # baseline, el modelo no diferencia bien señales fuertes de
+      # ruido — caso en el que tunear el threshold no ayuda.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 6          # vs 3 baseline — solo top quartile
+      cross_threshold_ticks: 999.0
+      max_seconds_to_resolution: 7200  # T<2h para volumen razonable
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.20
