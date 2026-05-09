@@ -267,13 +267,21 @@ def _variant_arg() -> str:
 
 
 def _configured_variants() -> list[str]:
-    """Read the configured variant list from config.yaml.
+    """Read the ENABLED variant list from config.yaml.
 
-    Falls back to `['main']` if the user hasn't migrated to the
-    `crypto_lag.variants:` block yet."""
+    Filters out variants with `enabled: false` so the dashboard only
+    shows the ones the bot is actually running. Falls back to `['main']`
+    if the user hasn't migrated to the `crypto_lag.variants:` block yet.
+    """
     cfg = (CONFIG.get("crypto_lag") or {}).get("variants")
     if isinstance(cfg, dict) and cfg:
-        return [str(k) for k in cfg.keys()]
+        out = []
+        for name, vcfg in cfg.items():
+            # Default to enabled=true; explicit `enabled: false` skips.
+            if isinstance(vcfg, dict) and vcfg.get("enabled", True) is False:
+                continue
+            out.append(str(name))
+        return out or ["main"]
     return ["main"]
 
 
