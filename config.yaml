@@ -494,3 +494,29 @@ crypto_lag:
       paper:
         queue_position_enabled: true
         q_toxic: 0.20
+    maker_focused:
+      # NUEVO 2026-05-09: variante experimental con DOBLE filtro
+      # ortogonal — combina lo que funcionó en near_* (filtro temporal)
+      # con lo que funcionó en wide_spread (filtro de spread). Las 4
+      # variantes anteriores tienen UN solo filtro cada una; esta es
+      # la primera que filtra en 2 dimensiones simultáneamente.
+      #
+      # Hipótesis: ambos filtros son LP-edge enhancers ortogonales:
+      #   - T<60min  → opera donde el modelo BS-digital tiene poder
+      #                predictivo real (post-strike o muy cerca)
+      #   - spread≥2 → solo books con spread genuino que capturar
+      # Combinados deberían dar mejor avg PnL/trade que cualquier
+      # filtro solo, aunque con menos closes/h (más selectivo).
+      # Si rinde mejor que las 4 actuales, valida que los filtros se
+      # multiplican constructivamente. Si rinde igual, valida que el
+      # edge maker es UNIFORME y no concentrado en una dimensión.
+      enabled: true
+      bankroll_usdc: 1000.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0
+      max_seconds_to_resolution: 3600  # 60 minutos (igual que near_60m)
+      min_book_spread_ticks: 2.0       # spread genuino (less strict que wide_spread=3t)
+      paper:
+        queue_position_enabled: true
+        q_toxic: 0.20

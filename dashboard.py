@@ -730,6 +730,35 @@ HTML = """
   <span style="font-size:13px;font-weight:400;color:#8b949e;margin-left:12px" id="last-refresh"></span>
 </h1>
 
+<!-- ============================================================
+     CRYPTO-LAG SUMMARY (top-of-page quick-glance card)
+     Populated by JS via /api/crypto_lag/variants. Shows bankroll,
+     ROI%, PnL$ for each variant in a compact row so you don't have
+     to scroll to the bottom of the page.
+     ============================================================ -->
+<div id="cl-summary-box" style="display:none;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin:14px 0">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+    <svg style="color:#79c0ff;width:18px;height:18px" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M13 2 3 14h7l-1 8 10-12h-7z" fill="currentColor"/>
+    </svg>
+    <h2 style="margin:0;font-size:15px;color:#79c0ff">Crypto-Lag — Resumen rápido</h2>
+    <span id="cl-summary-total" style="margin-left:auto;font-size:13px;color:#c9d1d9"></span>
+  </div>
+  <table id="cl-summary-table" style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead>
+      <tr style="color:#8b949e;font-weight:600;text-align:left">
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d">Variante</th>
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d;text-align:right">Bankroll</th>
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d;text-align:right">ROI %</th>
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d;text-align:right">PnL $</th>
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d;text-align:right">N closes</th>
+        <th style="padding:5px 8px;border-bottom:1px solid #21262d;text-align:right">Fills 24h</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
 <div id="alerts-bar"></div>
 
 <h2>Estado del Bot</h2>
@@ -1090,6 +1119,89 @@ async function refresh(){
 
 refresh();
 setInterval(refresh, 30000);
+
+/* =============================================================
+   CRYPTO-LAG SUMMARY (top-of-page card)
+   Refreshes every 30s using /api/crypto_lag/variants. Computes
+   ROI%/PnL relative to a fixed $1000 starting bankroll per variant
+   (matches the config default). Hidden when there are no variants.
+   ============================================================= */
+const CL_STARTING_BANKROLL = 1000.0;
+
+async function refreshCryptoLagSummary(){
+  try {
+    const r = await fetch('/api/crypto_lag/variants').then(r=>r.json());
+    const variants = (r && r.variants) || [];
+    const box = document.getElementById('cl-summary-box');
+    const tbody = document.querySelector('#cl-summary-table tbody');
+    const totalEl = document.getElementById('cl-summary-total');
+    if(!variants.length){ box.style.display='none'; return; }
+    box.style.display = 'block';
+
+    // Compute aggregate
+    let totalBk = 0, totalPnl = 0, hasAny = false;
+    const rows = variants.map(v => {
+      const bk = (v.bankroll_usdc != null) ? Number(v.bankroll_usdc) : null;
+      const pnl = (v.realized_pnl_lifetime_usdc != null)
+        ? Number(v.realized_pnl_lifetime_usdc) : null;
+      const closes = (v.closes != null) ? Number(v.closes) : 0;
+      const fills = (v.fills_24h != null) ? Number(v.fills_24h) : 0;
+      // ROI relative to starting bankroll
+      const roi = (bk != null) ? (100 * (bk - CL_STARTING_BANKROLL) / CL_STARTING_BANKROLL) : null;
+      if(bk != null){ totalBk += bk; hasAny = true; }
+      if(pnl != null){ totalPnl += pnl; }
+      return {name: v.name, bk, pnl, roi, closes, fills};
+    });
+
+    // Sort by PnL desc (winners on top)
+    rows.sort((a,b) => (b.pnl ?? -Infinity) - (a.pnl ?? -Infinity));
+
+    const fmtUsd = (v, signed) => {
+      if(v == null) return '<span style="color:#6e7681">—</span>';
+      const sign = signed && v >= 0 ? '+' : '';
+      const color = v > 0 ? '#3fb950' : (v < 0 ? '#f85149' : '#c9d1d9');
+      return `<span style="color:${color}">${sign}$${v.toFixed(2)}</span>`;
+    };
+    const fmtPct = v => {
+      if(v == null) return '<span style="color:#6e7681">—</span>';
+      const sign = v >= 0 ? '+' : '';
+      const color = v > 0 ? '#3fb950' : (v < 0 ? '#f85149' : '#c9d1d9');
+      return `<span style="color:${color}">${sign}${v.toFixed(1)}%</span>`;
+    };
+
+    tbody.innerHTML = rows.map(r => `
+      <tr style="border-bottom:1px solid #21262d22">
+        <td style="padding:6px 8px;font-weight:600">${r.name}</td>
+        <td style="padding:6px 8px;text-align:right">${fmtUsd(r.bk, false)}</td>
+        <td style="padding:6px 8px;text-align:right">${fmtPct(r.roi)}</td>
+        <td style="padding:6px 8px;text-align:right">${fmtUsd(r.pnl, true)}</td>
+        <td style="padding:6px 8px;text-align:right;color:#8b949e">${r.closes}</td>
+        <td style="padding:6px 8px;text-align:right;color:#8b949e">${r.fills}</td>
+      </tr>
+    `).join('');
+
+    if(hasAny){
+      const startTotal = CL_STARTING_BANKROLL * variants.length;
+      const totalRoi = 100 * (totalBk - startTotal) / startTotal;
+      const tcolor = totalPnl > 0 ? '#3fb950' : (totalPnl < 0 ? '#f85149' : '#c9d1d9');
+      const tsign = totalPnl >= 0 ? '+' : '';
+      const rsign = totalRoi >= 0 ? '+' : '';
+      totalEl.innerHTML = `
+        Total: <strong style="color:#c9d1d9">$${totalBk.toFixed(2)}</strong> /
+        $${startTotal.toFixed(0)}
+        (<span style="color:${tcolor}">${rsign}${totalRoi.toFixed(1)}%</span>,
+        <span style="color:${tcolor}">${tsign}$${totalPnl.toFixed(2)}</span>)
+      `;
+    } else {
+      totalEl.textContent = '';
+    }
+  } catch(e){
+    console.error('summary refresh failed:', e);
+  }
+}
+
+refreshCryptoLagSummary();
+setInterval(refreshCryptoLagSummary, 30000);
 
 /* =============================================================
    CRYPTO-LAG MAKER BOT — sección añadida 30-Apr-2026
