@@ -561,7 +561,13 @@ crypto_lag:
       # en -$50. Si va mal, /halt_live por Telegram corta inmediatamente.
       enabled: true
       mode: LIVE
-      bankroll_usdc: 100.0
+      bankroll_usdc: 200.0                 # nominal accounting cap (real USDC en wallet ≈ $113)
+      bankroll_floor_usdc: 50.0            # gate global por bankroll — coincide con halt_loss
+      variant_max_committed_usdc: 25.0     # max $25 USDC en órdenes simultáneas
+      placements_per_minute_limit: 30      # mismo límite que paper
+      circuit_breakers:
+        halt_file: data/crypto_lag.halt    # halt global (separado del halt_live LIVE-specific)
+        daily_max_loss_usdc: 50.0          # mismo umbral que halt_loss_usdc
       quote_mode: maker
       edge_threshold_cents: 3
       cross_threshold_ticks: 999.0
@@ -571,8 +577,8 @@ crypto_lag:
         max_order_usdc: 5.0
         max_concurrent_orders: 5
         whitelist_symbols: [BTCUSDT, ETHUSDT]
-        halt_file_path: data/halt_live
-        halt_loss_usdc: 50.0
+        halt_file_path: data/halt_live     # kill-switch LIVE-only
+        halt_loss_usdc: 50.0               # halt al perder 50% del capital
         signature_type: 1                  # 1 = Magic.link / Polymarket proxy
         host: https://clob.polymarket.com
         chain_id: 137
