@@ -556,9 +556,10 @@ crypto_lag:
       #   - halt_loss_usdc: $50 → al perder 50%, cancela todo y refuse new
       #   - halt_file: data/halt_live (touch para parar manualmente)
       #
-      # Activar SOLO cuando POLYMARKET_PRIVATE_KEY y FUNDER_ADDRESS estén
-      # en .env. Hasta entonces: enabled=false.
-      enabled: false
+      # ACTIVADO 2026-05-10: pre-flight checks OK (balance $113.14,
+      # API keys derivadas, allowances MAX). Smoke test arranca con halt
+      # en -$50. Si va mal, /halt_live por Telegram corta inmediatamente.
+      enabled: true
       mode: LIVE
       bankroll_usdc: 100.0
       quote_mode: maker
