@@ -452,6 +452,38 @@ class TelegramNotifier:
         )
         self._send(body, rate_key=f"clag_status_{status}", rate_interval_s=300)
 
+    def notify_crypto_lag_hourly_summary(self, *, variant: str, mode: str,
+                                         period_minutes: float,
+                                         placements: int, fills: int,
+                                         closes: int, gross_pnl_usdc: float,
+                                         fees_usdc: float, net_pnl_usdc: float,
+                                         bankroll_usdc: float,
+                                         halt_active: bool = False,
+                                         extra_lines: Optional[list] = None) -> None:
+        """Per-variant hourly recap. Used in LIVE mode in lieu of per-fill
+        notifications (those are firehose-spammy when the bot is active).
+        """
+        sev = _SEVERITY["error"] if halt_active else (
+            _SEVERITY["success"] if net_pnl_usdc >= 0 else _SEVERITY["warn"]
+        )
+        mode_tag = "LIVE" if mode.upper() == "LIVE" else "DEMO"
+        body = [
+            f"{sev} <b>⚡ Crypto-Lag {_h(mode_tag)} · {_h(variant)}</b>",
+            f"<i>{period_minutes:.0f}min recap</i>",
+            f"───────────────────────────",
+            f"💰 Net P&amp;L: <b>{_fmt_money(net_pnl_usdc)}</b>",
+            f"📈 Gross: {_fmt_money(gross_pnl_usdc)} · Fees: ${fees_usdc:.3f}",
+            f"📊 Placements: {placements} · Fills: {fills} · Closes: {closes}",
+            f"🏦 Bankroll: <b>${bankroll_usdc:.2f}</b>",
+        ]
+        if halt_active:
+            body.append(f"{_SEVERITY['error']} <b>HALT ACTIVE</b> — no nuevas órdenes")
+        if extra_lines:
+            for line in extra_lines:
+                body.append(_h(str(line)))
+        # No rate-limit: this is a once-per-hour event.
+        self._send("\n".join(body))
+
     # ─── Risk events ──────────────────────────────────────────
     def notify_circuit_breaker(self, trade_data: dict, *, recovered_usdc: float,
                                loss_avoided_usdc: float = 0.0) -> None:

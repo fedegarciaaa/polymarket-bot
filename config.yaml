@@ -543,6 +543,38 @@ crypto_lag:
       paper:
         queue_position_enabled: true
         q_toxic: 0.20
+    live_focused:
+      # NUEVO 2026-05-10: PRIMERA variante LIVE — smoke test con $100
+      # reales en Polymarket CLOB. Es la misma estrategia que
+      # `maker_focused` (lead +584% paper ROI tras 12h post-fix),
+      # pero ejecutada contra el CLOB real via py-clob-client.
+      #
+      # SAFETY:
+      #   - max_order_usdc: $5 (notional por orden)
+      #   - max_concurrent_orders: 5 → max $25 USDC comprometido a la vez
+      #   - whitelist_symbols: solo BTC/ETH (los más líquidos)
+      #   - halt_loss_usdc: $50 → al perder 50%, cancela todo y refuse new
+      #   - halt_file: data/halt_live (touch para parar manualmente)
+      #
+      # Activar SOLO cuando POLYMARKET_PRIVATE_KEY y FUNDER_ADDRESS estén
+      # en .env. Hasta entonces: enabled=false.
+      enabled: false
+      mode: LIVE
+      bankroll_usdc: 100.0
+      quote_mode: maker
+      edge_threshold_cents: 3
+      cross_threshold_ticks: 999.0
+      max_seconds_to_resolution: 3600
+      min_book_spread_ticks: 2.0
+      live:
+        max_order_usdc: 5.0
+        max_concurrent_orders: 5
+        whitelist_symbols: [BTCUSDT, ETHUSDT]
+        halt_file_path: data/halt_live
+        halt_loss_usdc: 50.0
+        signature_type: 1                  # 1 = Magic.link / Polymarket proxy
+        host: https://clob.polymarket.com
+        chain_id: 137
     maker_selective:
       # NUEVO 2026-05-09: top-conviction-only test.
       # `edge_threshold_cents=6` (vs 3 baseline). En tails F5 → 24 cents

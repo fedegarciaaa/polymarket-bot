@@ -140,17 +140,16 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
     if not cfg.get("enabled"):
         logger.info("crypto_lag: disabled (config.crypto_lag.enabled=false)")
         return None
-    mode = (cfg.get("mode") or config.get("bot", {}).get("mode", "DEMO")).upper()
-    if mode != "DEMO":
-        logger.warning(
-            "crypto_lag: only DEMO mode is wired today; ignoring requested mode "
-            f"{mode!r} and running in DEMO."
-        )
+    global_mode = (cfg.get("mode") or config.get("bot", {}).get("mode", "DEMO")).upper()
+    # Per-variant mode override is read inside the loop below — DEMO globally
+    # but a single variant can opt into LIVE via `mode: LIVE` in its block.
+    # We no longer warn on global LIVE: the per-variant gate handles activation.
 
     # Late imports so we don't pay startup cost when the module is disabled.
     from strategies.crypto_lag.binance_feed import BinanceFeed
     from strategies.crypto_lag.poly_markets import CryptoMarketRegistry
     from strategies.crypto_lag.paper_executor import PaperExecutor
+    from strategies.crypto_lag.live_executor import LiveExecutor
     from strategies.crypto_lag.order_engine import (
         MakerOrderEngine, FEE_RATE_CRYPTO, MAKER_REBATE_SHARE,
     )
@@ -225,30 +224,55 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
         variant_config_for_risk = dict(config)
         variant_config_for_risk["crypto_lag"] = eff
         paper_cfg_v = eff.get("paper") or {}
-        executor = PaperExecutor(
-            q_toxic=float(paper_cfg_v.get("q_toxic", 0.30)),
-            adverse_haircut_pct=float(paper_cfg_v.get("adverse_haircut_pct", 0.015)),
-            fee_rate=float(eff.get("fee_rate", FEE_RATE_CRYPTO)),
-            maker_rebate_share=float(eff.get("maker_rebate_share", MAKER_REBATE_SHARE)),
-            queue_position_enabled=bool(paper_cfg_v.get("queue_position_enabled", True)),
-            # LIVE-realism knobs (default: realistic). Tunable per variant via
-            # `paper.live_realistic_rebates / taker_race_lost_pct / q_toxic_extreme_scaling`.
-            live_realistic_rebates=bool(paper_cfg_v.get("live_realistic_rebates", True)),
-            taker_race_lost_pct=float(paper_cfg_v.get("taker_race_lost_pct", 0.25)),
-            q_toxic_extreme_scaling=bool(paper_cfg_v.get("q_toxic_extreme_scaling", True)),
-            depth_haircut_enabled=bool(paper_cfg_v.get("depth_haircut_enabled", True)),
-            maker_race_lost_pct=float(paper_cfg_v.get("maker_race_lost_pct", 0.15)),
-            queue_advance_credit_pct=float(paper_cfg_v.get("queue_advance_credit_pct", 0.50)),
-            # Post-audit fidelity fixes (2026-05-09). Defaults match the
-            # PaperExecutor constructor's so behavior is unchanged unless
-            # the variant explicitly overrides under `paper:`.
-            adverse_size_attenuation=float(paper_cfg_v.get("adverse_size_attenuation", 1.0)),
-            min_fill_usdc=float(paper_cfg_v.get("min_fill_usdc", 0.50)),
-            maker_race_lost_max=float(paper_cfg_v.get("maker_race_lost_max", 0.65)),
-            q_toxic_extreme_cap=float(paper_cfg_v.get("q_toxic_extreme_cap", 0.70)),
-            depth_extreme_multiplier=float(paper_cfg_v.get("depth_extreme_multiplier", 0.50)),
-            depth_near_extreme_multiplier=float(paper_cfg_v.get("depth_near_extreme_multiplier", 0.75)),
-        )
+        # Per-variant mode override. Default is the global crypto_lag mode.
+        # When mode=LIVE, the variant uses LiveExecutor (real Polymarket CLOB)
+        # instead of PaperExecutor. The first LIVE variant per session must
+        # have credentials in env vars or start() will fail fast.
+        variant_mode = str(eff.get("mode", global_mode)).upper()
+        live_cfg = eff.get("live") or {}
+        if variant_mode == "LIVE":
+            logger.warning(
+                f"crypto_lag [{vname}]: mode=LIVE — instantiating LiveExecutor. "
+                "Real money on Polymarket CLOB."
+            )
+            executor = LiveExecutor(
+                variant=vname,
+                host=str(live_cfg.get("host", "https://clob.polymarket.com")),
+                chain_id=int(live_cfg.get("chain_id", 137)),
+                signature_type=int(live_cfg.get("signature_type", 1)),
+                max_order_usdc=float(live_cfg.get("max_order_usdc", 5.0)),
+                sanity_checks_enabled=bool(live_cfg.get("sanity_checks_enabled", True)),
+                whitelist_symbols=live_cfg.get("whitelist_symbols"),
+                max_concurrent_orders=int(live_cfg.get("max_concurrent_orders", 5)),
+                halt_file_path=str(live_cfg.get("halt_file_path", "data/halt_live")),
+                halt_loss_usdc=float(live_cfg.get("halt_loss_usdc", 50.0)),
+                creds_cache_path=str(live_cfg.get("creds_cache_path", "data/clob_api_creds.json")),
+            )
+        else:
+            executor = PaperExecutor(
+                q_toxic=float(paper_cfg_v.get("q_toxic", 0.30)),
+                adverse_haircut_pct=float(paper_cfg_v.get("adverse_haircut_pct", 0.015)),
+                fee_rate=float(eff.get("fee_rate", FEE_RATE_CRYPTO)),
+                maker_rebate_share=float(eff.get("maker_rebate_share", MAKER_REBATE_SHARE)),
+                queue_position_enabled=bool(paper_cfg_v.get("queue_position_enabled", True)),
+                # LIVE-realism knobs (default: realistic). Tunable per variant via
+                # `paper.live_realistic_rebates / taker_race_lost_pct / q_toxic_extreme_scaling`.
+                live_realistic_rebates=bool(paper_cfg_v.get("live_realistic_rebates", True)),
+                taker_race_lost_pct=float(paper_cfg_v.get("taker_race_lost_pct", 0.25)),
+                q_toxic_extreme_scaling=bool(paper_cfg_v.get("q_toxic_extreme_scaling", True)),
+                depth_haircut_enabled=bool(paper_cfg_v.get("depth_haircut_enabled", True)),
+                maker_race_lost_pct=float(paper_cfg_v.get("maker_race_lost_pct", 0.15)),
+                queue_advance_credit_pct=float(paper_cfg_v.get("queue_advance_credit_pct", 0.50)),
+                # Post-audit fidelity fixes (2026-05-09). Defaults match the
+                # PaperExecutor constructor's so behavior is unchanged unless
+                # the variant explicitly overrides under `paper:`.
+                adverse_size_attenuation=float(paper_cfg_v.get("adverse_size_attenuation", 1.0)),
+                min_fill_usdc=float(paper_cfg_v.get("min_fill_usdc", 0.50)),
+                maker_race_lost_max=float(paper_cfg_v.get("maker_race_lost_max", 0.65)),
+                q_toxic_extreme_cap=float(paper_cfg_v.get("q_toxic_extreme_cap", 0.70)),
+                depth_extreme_multiplier=float(paper_cfg_v.get("depth_extreme_multiplier", 0.50)),
+                depth_near_extreme_multiplier=float(paper_cfg_v.get("depth_near_extreme_multiplier", 0.75)),
+            )
 
         # Per-variant bankroll: prefer the per-variant override, fall back to
         # the global default. If reset_on_start is false AND we have persisted
@@ -316,6 +340,7 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             deribit_iv=deribit_iv,
             variant=vname,
             variant_overrides=voverrides,
+            mode=variant_mode,
         )
         variants[vname] = VariantHandle(
             name=vname, cycle=cycle, executor=executor, engine=engine, risk=risk,

@@ -25,6 +25,7 @@ import asyncio
 import logging
 import math
 import time
+from pathlib import Path
 from typing import Optional
 
 from .binance_feed import BinanceFeed
@@ -66,10 +67,16 @@ class CryptoLagCycle:
         deribit_iv=None,    # DeribitIVProvider | None
         variant: str = "main",
         variant_overrides: Optional[dict] = None,
+        mode: str = "DEMO",
     ):
         # variant identifies this instance in DB / dashboard; e.g. "main" for
         # the strict simulator and "permissive" for the optimistic shadow.
         self.variant = str(variant)
+        # mode = "DEMO" | "LIVE". Drives Telegram behavior: in LIVE we
+        # suppress per-fill / per-close notifications (would be spammy)
+        # and emit a single hourly summary instead, alongside the existing
+        # CRYPTO_LAG_VARIANT_STATS structured event.
+        self.mode = str(mode).upper()
         # `variant_overrides` lets the runner inject per-variant params (e.g.
         # edge_threshold, queue_position_enabled, ...) without mutating the
         # shared `config` dict between siblings. Falls back to the legacy
@@ -420,7 +427,9 @@ class CryptoLagCycle:
             self._fees_period += float(getattr(f, "fee_paid_usdc", 0.0) or 0.0)
             self._rebates_period += float(getattr(f, "rebate_usdc", 0.0) or 0.0)
             self._record_trade(f, now)
-            if self.notifier is not None:
+            # In LIVE mode skip per-fill telegram (firehose). Hourly summary
+            # in `_emit_variant_stats` carries the aggregate instead.
+            if self.notifier is not None and self.mode != "LIVE":
                 try:
                     self.notifier.notify_crypto_lag_fill(
                         symbol=f.symbol, side=f.side, outcome=f.outcome,
@@ -474,7 +483,8 @@ class CryptoLagCycle:
                 self._gross_pnl_period += float(ev.realized_pnl_usdc)
                 self._closes_period += 1
                 self._record_close(ev)
-                if self.notifier is not None:
+                # In LIVE mode skip per-close telegram (covered by hourly summary).
+                if self.notifier is not None and self.mode != "LIVE":
                     try:
                         self.notifier.notify_crypto_lag_close(
                             symbol=ev.symbol,
@@ -863,6 +873,33 @@ class CryptoLagCycle:
             )
         except Exception as exc:
             logger.debug(f"variant stats event write failed: {exc}")
+
+        # LIVE-mode hourly Telegram summary. The user explicitly asked us
+        # to silence per-fill notifications in LIVE; this is the single
+        # heartbeat they get instead. Skipped in DEMO to avoid duplicating
+        # the dashboard signal.
+        if self.notifier is not None and self.mode == "LIVE":
+            try:
+                halt_active = False
+                hf = getattr(self.executor, "halt_file_path", None)
+                latched = bool(getattr(self.executor, "_halted", False))
+                if latched or (hf is not None and Path(hf).exists()):
+                    halt_active = True
+                self.notifier.notify_crypto_lag_hourly_summary(
+                    variant=self.variant,
+                    mode=self.mode,
+                    period_minutes=elapsed / 60.0,
+                    placements=placements,
+                    fills=fills,
+                    closes=closes,
+                    gross_pnl_usdc=gross_pnl,
+                    fees_usdc=fees,
+                    net_pnl_usdc=net_pnl,
+                    bankroll_usdc=float(risk_snapshot.get("bankroll_usdc") or 0.0),
+                    halt_active=halt_active,
+                )
+            except Exception as exc:
+                logger.warning(f"hourly summary telegram failed: {exc}")
 
         # Fase 1: persist per-variant bankroll/PnL so a restart resumes from
         # the latest snapshot. Cheap (single UPSERT per variant per period).
