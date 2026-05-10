@@ -68,6 +68,7 @@ class CryptoLagCycle:
         variant: str = "main",
         variant_overrides: Optional[dict] = None,
         mode: str = "DEMO",
+        symbol_whitelist: Optional[set] = None,
     ):
         # variant identifies this instance in DB / dashboard; e.g. "main" for
         # the strict simulator and "permissive" for the optimistic shadow.
@@ -77,6 +78,16 @@ class CryptoLagCycle:
         # and emit a single hourly summary instead, alongside the existing
         # CRYPTO_LAG_VARIANT_STATS structured event.
         self.mode = str(mode).upper()
+        # symbol_whitelist: set of UPPERCASE binance symbols. When set,
+        # _tick skips markets whose symbol is not in the whitelist. The
+        # main use is LIVE mode — without this, the cycle iterates all
+        # 6 symbols × all active markets and the LiveExecutor's REST
+        # calls saturate the per-tick budget, preventing any snapshot
+        # from being emitted. None means "all symbols" (paper default).
+        self.symbol_whitelist = (
+            {str(s).upper() for s in symbol_whitelist}
+            if symbol_whitelist else None
+        )
         # `variant_overrides` lets the runner inject per-variant params (e.g.
         # edge_threshold, queue_position_enabled, ...) without mutating the
         # shared `config` dict between siblings. Falls back to the legacy
@@ -206,8 +217,12 @@ class CryptoLagCycle:
 
         in_freeze = self.feed.is_in_reconnect_freeze(now)
 
-        # 1. Iterate active markets per symbol
+        # 1. Iterate active markets per symbol. Variants with a
+        # symbol_whitelist (typically LIVE) skip non-whitelisted symbols
+        # to bound per-tick REST calls.
         for sym in self.feed.symbols:
+            if self.symbol_whitelist and sym.upper() not in self.symbol_whitelist:
+                continue
             feed_state = self.feed.get_state(sym)
             if feed_state is None:
                 continue

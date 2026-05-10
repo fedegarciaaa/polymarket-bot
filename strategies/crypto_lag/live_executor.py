@@ -196,6 +196,13 @@ class LiveExecutor:
         # Initialised to start time on `start()` so backlog from before this
         # process boot doesn't trigger phantom fills.
         self._last_trade_ts: int = 0
+        # _get_book TTL cache (in-memory). Without this, each cycle calls
+        # get_order_book() per market via REST → at 200-500ms per call and
+        # multiple markets per symbol the per-tick budget explodes. The
+        # cycle still queries every tick, but cache hits are free.
+        self._book_cache: dict[str, dict] = {}
+        self._book_cache_ts: dict[str, float] = {}
+        self._book_cache_ttl_s: float = 1.5
 
     # ─── Halt logic ────────────────────────────────────────────
     def _check_halt(self) -> tuple[bool, str]:
@@ -646,10 +653,16 @@ class LiveExecutor:
     async def _get_book(self, token_id: str) -> dict:
         """Return the order book in the same shape as paper_executor.
 
-        Shape: {best_bid, best_ask, bid_size, ask_size}
+        Shape: {best_bid, best_ask, bid_size, ask_size}.
+        TTL-cached (default 1.5s) to bound per-tick REST calls when
+        the cycle iterates many markets.
         """
         if not self._started or self._client is None:
             return {}
+        now = time.time()
+        cached_ts = self._book_cache_ts.get(token_id, 0.0)
+        if now - cached_ts < self._book_cache_ttl_s:
+            return self._book_cache.get(token_id, {})
         loop = asyncio.get_event_loop()
         try:
             book = await loop.run_in_executor(
@@ -674,10 +687,14 @@ class LiveExecutor:
 
         best_bid, bid_size = _top("bids", sort_high=True)
         best_ask, ask_size = _top("asks", sort_high=False)
-        return {
+        result = {
             "best_bid": best_bid, "bid_size": bid_size,
             "best_ask": best_ask, "ask_size": ask_size,
         }
+        # Cache forward — TTL bound = self._book_cache_ttl_s.
+        self._book_cache[token_id] = result
+        self._book_cache_ts[token_id] = now
+        return result
 
     def get_queue_debt(self, order_id: str) -> float:
         """LIVE doesn't model FIFO queue position — Polymarket doesn't expose

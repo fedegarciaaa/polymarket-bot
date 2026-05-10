@@ -334,6 +334,19 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             extreme_price_max=float(eff.get("extreme_price_max", 0.90)),
             extreme_edge_multiplier=float(eff.get("extreme_edge_multiplier", 4.0)),
         )
+        cycle_symbol_whitelist = None
+        if variant_mode == "LIVE":
+            # LIVE variants must have a tight whitelist or the cycle
+            # saturates with REST calls; default to the live config's
+            # whitelist if present, else all symbols (warn).
+            wl = live_cfg.get("whitelist_symbols")
+            if wl:
+                cycle_symbol_whitelist = set(wl)
+            else:
+                logger.warning(
+                    f"crypto_lag [{vname}]: mode=LIVE without whitelist_symbols "
+                    "— cycle will iterate all symbols (may saturate REST budget)."
+                )
         cycle = CryptoLagCycle(
             config=config, feed=feed, registry=registry, executor=executor,
             engine=engine, risk=risk, db=db, notifier=notifier,
@@ -341,6 +354,7 @@ def start_crypto_lag(config: dict, db, logger: logging.Logger,
             variant=vname,
             variant_overrides=voverrides,
             mode=variant_mode,
+            symbol_whitelist=cycle_symbol_whitelist,
         )
         variants[vname] = VariantHandle(
             name=vname, cycle=cycle, executor=executor, engine=engine, risk=risk,
