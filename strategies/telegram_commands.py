@@ -157,6 +157,9 @@ class TelegramCommandHandler:
         handlers = {
             "/setpk": self._cmd_setpk,
             "/setfunder": self._cmd_setfunder,
+            "/setbuilderkey": self._cmd_setbuilderkey,
+            "/setbuildersecret": self._cmd_setbuildersecret,
+            "/setbuilderpass": self._cmd_setbuilderpass,
             "/restart_bot": self._cmd_restart,
             "/halt_live": self._cmd_halt,
             "/unhalt_live": self._cmd_unhalt,
@@ -180,6 +183,9 @@ class TelegramCommandHandler:
             "<b>Comandos disponibles</b>\n"
             "<code>/setpk &lt;hex&gt;</code> — guarda POLYMARKET_PRIVATE_KEY (auto-borra mensaje)\n"
             "<code>/setfunder 0x…</code> — guarda POLYMARKET_FUNDER_ADDRESS\n"
+            "<code>/setbuilderkey &lt;key&gt;</code> — guarda BUILDER_KEY (auto-borra)\n"
+            "<code>/setbuildersecret &lt;sec&gt;</code> — guarda BUILDER_SECRET (auto-borra)\n"
+            "<code>/setbuilderpass &lt;pass&gt;</code> — guarda BUILDER_PASSPHRASE (auto-borra)\n"
             "<code>/restart_bot</code> — reinicia (systemd recarga .env)\n"
             "<code>/halt_live</code> — kill switch instantáneo (cancela órdenes LIVE)\n"
             "<code>/unhalt_live</code> — quita el kill switch (requiere /restart_bot después)\n"
@@ -217,6 +223,36 @@ class TelegramCommandHandler:
         if ok:
             return f"✅ Funder address guardada: <code>{clean[:6]}…{clean[-4:]}</code>"
         return "❌ Error escribiendo .env"
+
+    def _cmd_setbuilderkey(self, arg: str, msg: dict) -> str:
+        if not arg:
+            return "Uso: <code>/setbuilderkey &lt;key&gt;</code>"
+        clean = arg.strip().split()[0]
+        if len(clean) < 8:
+            return "❌ Builder key parece muy corta"
+        ok = self._write_env_var("POLYMARKET_BUILDER_KEY", clean)
+        self._delete_message(msg.get("chat", {}).get("id"), msg.get("message_id"))
+        return f"✅ Builder key guardada (<code>{clean[:6]}…</code>). Mensaje borrado."
+
+    def _cmd_setbuildersecret(self, arg: str, msg: dict) -> str:
+        if not arg:
+            return "Uso: <code>/setbuildersecret &lt;secret&gt;</code>"
+        clean = arg.strip().split()[0]
+        if len(clean) < 8:
+            return "❌ Builder secret parece muy corto"
+        ok = self._write_env_var("POLYMARKET_BUILDER_SECRET", clean)
+        self._delete_message(msg.get("chat", {}).get("id"), msg.get("message_id"))
+        return f"✅ Builder secret guardado. Mensaje borrado."
+
+    def _cmd_setbuilderpass(self, arg: str, msg: dict) -> str:
+        if not arg:
+            return "Uso: <code>/setbuilderpass &lt;passphrase&gt;</code>"
+        clean = arg.strip().split()[0]
+        if len(clean) < 4:
+            return "❌ Builder passphrase parece muy corta"
+        ok = self._write_env_var("POLYMARKET_BUILDER_PASSPHRASE", clean)
+        self._delete_message(msg.get("chat", {}).get("id"), msg.get("message_id"))
+        return f"✅ Builder passphrase guardada. Mensaje borrado."
 
     def _cmd_restart(self, _arg, _msg) -> str:
         # Reply BEFORE exiting so the user sees confirmation.
