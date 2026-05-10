@@ -191,6 +191,11 @@ class LiveExecutor:
         # Halt latch: once tripped we stay halted until the file is removed
         # AND the process restarts — defensive against accidental clears.
         self._halted = False
+        # poll_fills uses TradeParams.after to query incrementally. We track
+        # the latest trade ts we've seen so each poll only returns NEW trades.
+        # Initialised to start time on `start()` so backlog from before this
+        # process boot doesn't trigger phantom fills.
+        self._last_trade_ts: int = 0
 
     # ─── Halt logic ────────────────────────────────────────────
     def _check_halt(self) -> tuple[bool, str]:
@@ -284,6 +289,9 @@ class LiveExecutor:
             ),
         )
         self._started = True
+        # Anchor poll_fills incrementality at start — trades older than this
+        # are ignored so a wallet with prior CLOB history doesn't replay.
+        self._last_trade_ts = int(time.time())
         # First-call sanity: log balance so the operator can confirm the
         # wallet has USDC before any order goes out.
         try:
@@ -419,9 +427,16 @@ class LiveExecutor:
             "market_slug": order.market_slug,
             "end_ts": order.end_ts, "strike_price": order.strike_price,
         }
+        # Verbose LIVE log so post-mortem can reconstruct the smoke run:
+        # full price, size, raw response, time. Watch journalctl -fu polymarket-bot
+        # filtered by "LIVE-PLACE".
         logger.info(
-            f"LIVE [{self.variant}] placed {order.side} {order.symbol} "
-            f"${order.size_usdc:.2f}@{order.price:.4f} ext={ext_id[:12]}"
+            f"LIVE-PLACE [{self.variant}] {order.side} {order.symbol} "
+            f"slug={order.market_slug[:30]} "
+            f"px={order.price:.4f} size_shares={size_shares:.4f} "
+            f"size_usdc=${order.size_usdc:.2f} "
+            f"is_taker={order.is_taker} ext={ext_id[:16]} "
+            f"resp_keys={sorted((resp or {}).keys()) if isinstance(resp, dict) else type(resp).__name__}"
         )
         return ext_id
 
@@ -450,17 +465,20 @@ class LiveExecutor:
     async def poll_fills(self) -> list[_FillEvent]:
         """Poll CLOB for trades against our resting orders.
 
-        We use `get_trades` filtered by maker_address (=funder) since the
-        last poll. Each trade row produces one _FillEvent.
+        Uses `get_trades(TradeParams(after=self._last_trade_ts))` for
+        incremental queries — without this we'd re-process the entire
+        wallet trade history on every poll.
         """
         if not self._started or self._client is None:
             return []
         # Halt check is non-blocking here — we still want to drain remaining
         # fills for already-placed orders even after halt is tripped.
+        from py_clob_client.clob_types import TradeParams  # type: ignore
+        params = TradeParams(after=self._last_trade_ts)
         loop = asyncio.get_event_loop()
         try:
             trades = await loop.run_in_executor(
-                None, lambda: self._client.get_trades()
+                None, lambda: self._client.get_trades(params)
             )
         except Exception as exc:
             logger.warning(f"LIVE [{self.variant}] get_trades failed: {exc}")
@@ -471,7 +489,14 @@ class LiveExecutor:
 
         events: list[_FillEvent] = []
         now = time.time()
+        max_seen_ts = self._last_trade_ts
         for t in trades:
+            try:
+                trade_ts = int(t.get("match_time") or t.get("timestamp") or t.get("ts") or 0)
+                if trade_ts > max_seen_ts:
+                    max_seen_ts = trade_ts
+            except (TypeError, ValueError):
+                pass
             ext = str(t.get("maker_order_id") or t.get("order_id") or "")
             if not ext or ext not in self._resting:
                 continue
@@ -502,10 +527,24 @@ class LiveExecutor:
             events.append(ev)
             self._apply_fill_to_position(ev, order)
             order.filled_size_usdc += fill_size_usdc
+            # LIVE-FILL log mirrors LIVE-PLACE so we can match each fill back
+            # to its placement post-mortem.
+            logger.info(
+                f"LIVE-FILL [{self.variant}] {order.side} {order.symbol} "
+                f"slug={order.market_slug[:30]} "
+                f"placed_px={order.price:.4f} actual_px={fill_price:.4f} "
+                f"shares={fill_shares:.4f} usdc=${fill_size_usdc:.2f} "
+                f"fee=${fee_paid:.4f} "
+                f"slippage_pct={(fill_price - order.price) / max(0.001, order.price) * 100:+.3f} "
+                f"ext={ext[:16]}"
+            )
             # Fully filled → drop from resting; partials stay.
             if order.filled_size_usdc + 1e-6 >= order.size_usdc:
                 self._resting.pop(ext, None)
 
+        # Persist forward progress so the next poll only fetches NEW trades.
+        if max_seen_ts > self._last_trade_ts:
+            self._last_trade_ts = max_seen_ts
         return events
 
     def _apply_fill_to_position(self, ev: _FillEvent, order: RestingOrder) -> None:
@@ -573,6 +612,16 @@ class LiveExecutor:
             accumulated_rebate_usdc=0.0,
         )
         self._close_log.append(ev)
+        # LIVE-CLOSE log: forensic-grade. Includes shares, payoff, cost basis
+        # and entry vs final price so we can audit each close manually.
+        logger.info(
+            f"LIVE-CLOSE [{self.variant}] {pos.symbol} cid={condition_id[:12]} "
+            f"outcome={pos.outcome} entry_px={pos.avg_entry_price:.4f} "
+            f"yes_final={yes_outcome_value:.2f} "
+            f"shares={shares:.2f} cost=${cost_basis:.2f} payoff=${payoff:.2f} "
+            f"pnl=${pnl:+.2f} lifetime=${self._lifetime_realized_pnl:+.2f} "
+            f"slug={pos.market_slug[:30]}"
+        )
         # Re-evaluate halt now that PnL has updated.
         halted, reason = self._check_halt()
         if halted:

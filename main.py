@@ -843,6 +843,51 @@ def main():
     except Exception as exc:
         logger.warning(f"crypto_lag failed to start (continuing without it): {exc}")
 
+    # Telegram operator commands listener (daemon thread). Handles:
+    #   /setpk, /setfunder         — write LIVE credentials to .env securely
+    #   /restart_bot               — exit(0); systemd reloads .env on restart
+    #   /halt_live, /unhalt_live   — kill switch for LIVE crypto_lag variant
+    #   /clag_status               — quick status reply
+    # Only the chat in TELEGRAM_CHAT_ID can issue these commands.
+    tg_cmd_handler = None
+    try:
+        from strategies.telegram_commands import TelegramCommandHandler
+
+        def _clag_status() -> dict:
+            out: dict = {"crypto_lag_enabled": cl_enabled}
+            handle = crypto_lag_handle
+            if handle is None:
+                return out
+            variants = getattr(handle, "variants", {}) or {}
+            live_variants = []
+            for vname, vh in variants.items():
+                cycle = getattr(vh, "cycle", None)
+                executor = getattr(vh, "executor", None)
+                mode = getattr(cycle, "mode", "DEMO") if cycle else "DEMO"
+                if mode != "LIVE":
+                    continue
+                halted = bool(getattr(executor, "_halted", False))
+                lifetime_pnl = float(getattr(executor, "_lifetime_realized_pnl", 0.0))
+                open_orders = len(getattr(executor, "_resting", {}) or {})
+                live_variants.append({
+                    "variant": vname, "halted": halted,
+                    "lifetime_pnl_usdc": round(lifetime_pnl, 2),
+                    "open_orders": open_orders,
+                })
+            if live_variants:
+                out["live_variants"] = live_variants
+            return out
+
+        tg_cmd_handler = TelegramCommandHandler(
+            env_path="/home/botuser/polymarket-bot/.env",
+            offset_path="/home/botuser/polymarket-bot/data/.tg_cmd_offset",
+            halt_file_path="/home/botuser/polymarket-bot/data/halt_live",
+            status_provider=_clag_status,
+        )
+        tg_cmd_handler.start()
+    except Exception as exc:
+        logger.warning(f"telegram command handler failed to start: {exc}")
+
     # Daily summary at 23:55 UTC — runs in the main thread via `schedule`.
     def _send_daily_summary():
         try:
