@@ -207,6 +207,9 @@ class LiveExecutor:
         # different signing depending on the type. Cache token_id → bool
         # so we don't call get_neg_risk() per placement.
         self._neg_risk_cache: dict[str, bool] = {}
+        # tick_size is also signing-dependent (server validates the EIP-712
+        # hash includes it). Cache per token_id; immutable for a market.
+        self._tick_size_cache: dict[str, str] = {}
 
     # ─── Halt logic ────────────────────────────────────────────
     def _check_halt(self) -> tuple[bool, str]:
@@ -407,10 +410,10 @@ class LiveExecutor:
             side=side_const,
         )
 
-        # Polymarket has two market families: regular and negRisk. Orders
-        # for negRisk markets need a different signing flag — without it,
-        # the server rejects with `order_version_mismatch`. We cache the
-        # flag per token_id (it doesn't change for a given market).
+        # Polymarket signing requires BOTH neg_risk + tick_size for the
+        # EIP-712 hash to match the server. Without either, the server
+        # rejects with `order_version_mismatch`. Cache per token_id —
+        # both values are immutable for a given market.
         neg_risk = self._neg_risk_cache.get(token_id)
         if neg_risk is None:
             try:
@@ -423,7 +426,19 @@ class LiveExecutor:
                 neg_risk = False
             self._neg_risk_cache[token_id] = neg_risk
 
-        opts = PartialCreateOrderOptions(neg_risk=neg_risk)
+        tick_size = self._tick_size_cache.get(token_id)
+        if tick_size is None:
+            try:
+                tick_size = self._client.get_tick_size(token_id)
+            except Exception as exc:
+                logger.warning(
+                    f"LIVE [{self.variant}] get_tick_size({token_id[:12]}) failed: {exc}"
+                    " — assuming 0.01"
+                )
+                tick_size = "0.01"
+            self._tick_size_cache[token_id] = tick_size
+
+        opts = PartialCreateOrderOptions(neg_risk=neg_risk, tick_size=tick_size)
 
         loop = asyncio.get_event_loop()
         try:
