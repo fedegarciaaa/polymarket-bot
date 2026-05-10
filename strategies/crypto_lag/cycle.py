@@ -442,17 +442,9 @@ class CryptoLagCycle:
             self._fees_period += float(getattr(f, "fee_paid_usdc", 0.0) or 0.0)
             self._rebates_period += float(getattr(f, "rebate_usdc", 0.0) or 0.0)
             self._record_trade(f, now)
-            # In LIVE mode skip per-fill telegram (firehose). Hourly summary
-            # in `_emit_variant_stats` carries the aggregate instead.
-            if self.notifier is not None and self.mode != "LIVE":
-                try:
-                    self.notifier.notify_crypto_lag_fill(
-                        symbol=f.symbol, side=f.side, outcome=f.outcome,
-                        fill_price=f.fill_price, fill_size_usdc=f.fill_size_usdc,
-                        is_adverse=f.is_adverse,
-                    )
-                except Exception as exc:
-                    logger.debug(f"notify_crypto_lag_fill failed: {exc}")
+            # Per-fill Telegram suppressed in ALL modes (DEMO + LIVE) — would
+            # be firehose-spammy. Hourly summary in `_emit_variant_stats`
+            # carries the aggregate instead.
 
         # Resolutions: any market whose endDate passed → settle.
         # We iterate `executor._positions` and use the end_ts/strike/symbol
@@ -498,18 +490,8 @@ class CryptoLagCycle:
                 self._gross_pnl_period += float(ev.realized_pnl_usdc)
                 self._closes_period += 1
                 self._record_close(ev)
-                # In LIVE mode skip per-close telegram (covered by hourly summary).
-                if self.notifier is not None and self.mode != "LIVE":
-                    try:
-                        self.notifier.notify_crypto_lag_close(
-                            symbol=ev.symbol,
-                            realized_pnl_usdc=ev.realized_pnl_usdc,
-                            final_yes_price=ev.final_yes_price,
-                            reason=ev.reason,
-                            market_slug=slug,
-                        )
-                    except Exception as exc:
-                        logger.debug(f"notify_crypto_lag_close failed: {exc}")
+                # Per-close Telegram suppressed in ALL modes (DEMO + LIVE).
+                # Aggregate goes in the hourly summary in _emit_variant_stats.
 
         # Drain any lingering close events the executor produced
         for ev in self.executor.drain_close_log():
@@ -889,11 +871,12 @@ class CryptoLagCycle:
         except Exception as exc:
             logger.debug(f"variant stats event write failed: {exc}")
 
-        # LIVE-mode hourly Telegram summary. The user explicitly asked us
-        # to silence per-fill notifications in LIVE; this is the single
-        # heartbeat they get instead. Skipped in DEMO to avoid duplicating
-        # the dashboard signal.
-        if self.notifier is not None and self.mode == "LIVE":
+        # Hourly Telegram summary for ALL modes (DEMO + LIVE). Per-fill
+        # notifications are suppressed everywhere; this single heartbeat
+        # per variant per hour is what the operator gets instead. The
+        # `mode` field on the message lets the operator distinguish LIVE
+        # from DEMO at a glance.
+        if self.notifier is not None:
             try:
                 halt_active = False
                 hf = getattr(self.executor, "halt_file_path", None)
