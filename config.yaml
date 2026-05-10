@@ -564,6 +564,9 @@ crypto_lag:
       bankroll_usdc: 200.0                 # nominal accounting cap (real USDC en wallet ≈ $113)
       bankroll_floor_usdc: 50.0            # gate global por bankroll — coincide con halt_loss
       variant_max_committed_usdc: 25.0     # max $25 USDC en órdenes simultáneas
+      max_order_usdc: 5.0                  # engine cap por orden (LiveExecutor también enforce)
+      capital_pct: 0.025                   # target_size = 0.025 × bankroll = $5/orden
+      per_market_max_gross_usdc: 10.0      # max $10 fills por market (2 órdenes si llenan)
       placements_per_minute_limit: 30      # mismo límite que paper
       circuit_breakers:
         halt_file: data/crypto_lag.halt    # halt global (separado del halt_live LIVE-specific)
