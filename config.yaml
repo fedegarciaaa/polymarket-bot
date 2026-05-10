@@ -582,7 +582,7 @@ crypto_lag:
         whitelist_symbols: [BTCUSDT, ETHUSDT]
         halt_file_path: data/halt_live     # kill-switch LIVE-only
         halt_loss_usdc: 50.0               # halt al perder 50% del capital
-        signature_type: 1                  # 1 = Magic.link / Polymarket proxy
+        signature_type: 0                  # 0 = EOA direct (MetaMask, funder == EOA)
         host: https://clob.polymarket.com
         chain_id: 137
     maker_selective:
