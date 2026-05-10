@@ -203,6 +203,10 @@ class LiveExecutor:
         self._book_cache: dict[str, dict] = {}
         self._book_cache_ts: dict[str, float] = {}
         self._book_cache_ttl_s: float = 1.5
+        # Polymarket has both regular and negRisk markets; orders need
+        # different signing depending on the type. Cache token_id → bool
+        # so we don't call get_neg_risk() per placement.
+        self._neg_risk_cache: dict[str, bool] = {}
 
     # ─── Halt logic ────────────────────────────────────────────
     def _check_halt(self) -> tuple[bool, str]:
@@ -386,7 +390,9 @@ class LiveExecutor:
                     f">= max_concurrent_orders {self.max_concurrent_orders}"
                 )
 
-        from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+        from py_clob_client.clob_types import (  # type: ignore
+            OrderArgs, OrderType, PartialCreateOrderOptions,
+        )
         from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
 
         side_const = BUY if order.side == "BUY" else SELL
@@ -401,10 +407,28 @@ class LiveExecutor:
             side=side_const,
         )
 
+        # Polymarket has two market families: regular and negRisk. Orders
+        # for negRisk markets need a different signing flag — without it,
+        # the server rejects with `order_version_mismatch`. We cache the
+        # flag per token_id (it doesn't change for a given market).
+        neg_risk = self._neg_risk_cache.get(token_id)
+        if neg_risk is None:
+            try:
+                neg_risk = bool(self._client.get_neg_risk(token_id=token_id))
+            except Exception as exc:
+                logger.warning(
+                    f"LIVE [{self.variant}] get_neg_risk({token_id[:12]}) failed: {exc}"
+                    " — assuming False"
+                )
+                neg_risk = False
+            self._neg_risk_cache[token_id] = neg_risk
+
+        opts = PartialCreateOrderOptions(neg_risk=neg_risk)
+
         loop = asyncio.get_event_loop()
         try:
             signed = await loop.run_in_executor(
-                None, lambda: self._client.create_order(order_args)
+                None, lambda: self._client.create_order(order_args, opts)
             )
             tif = OrderType.FAK if order.is_taker else OrderType.GTC
             resp = await loop.run_in_executor(
@@ -413,7 +437,7 @@ class LiveExecutor:
         except Exception as exc:
             logger.error(
                 f"LIVE [{self.variant}] post_order failed: {order.side} {order.symbol} "
-                f"${order.size_usdc:.2f}@{order.price:.4f}: {exc}"
+                f"${order.size_usdc:.2f}@{order.price:.4f} neg_risk={neg_risk}: {exc}"
             )
             raise
 
